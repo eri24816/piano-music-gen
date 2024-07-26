@@ -3,6 +3,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 import random
+from typing import Generator
 from matplotlib import pyplot as plt
 import numpy as np
 from math import ceil
@@ -177,7 +178,7 @@ class PianoRoll:
         if end_time is not None:
             self.metadata.end_time = end_time
 
-    def iter_over_notes(self, notes=None):
+    def iter_over_notes_unpack(self, notes=None):
         """
         generator that yields (onset, pitch, velocity, offset iterator)
         """
@@ -186,19 +187,52 @@ class PianoRoll:
         for note in notes:
             yield note.onset, note.pitch, note.velocity, note.offset
 
-    def iter_over_bars(self, bar_length=32):
+    def iter_over_bars_unpack(
+        self, bar_length=32
+    ) -> Generator[list[Tuple[int, int, int, int]]]:
         """
         generator that yields (onset, pitch, velocity, offset iterator)
         """
+
+        iterator = iter(self.notes)
         for bar_start in range(0, self.duration, bar_length):
-            yield self.slice(bar_start, bar_start + bar_length)
+            list_of_notes = []
+            try:
+                while True:
+                    note = next(iterator)
+                    if note.onset >= bar_start + bar_length:
+                        break
+                    list_of_notes.append(
+                        (note.onset, note.pitch, note.velocity, note.offset)
+                    )
+            except StopIteration:
+                pass
+            yield list_of_notes
+
+    def iter_over_bars(self, bar_length=32) -> Generator[list[Note]]:
+        """
+        generator that yields list of notes in each bar
+        """
+
+        iterator = iter(self.notes)
+        for bar_start in range(0, self.duration, bar_length):
+            list_of_notes = []
+            try:
+                while True:
+                    note = next(iterator)
+                    if note.onset >= bar_start + bar_length:
+                        break
+                    list_of_notes.append(note)
+            except StopIteration:
+                pass
+            yield list_of_notes
 
     def get_offsets_with_pedal(self, pedal) -> list[int]:
         offsets = []
         next_onset = [INF] * 88
         i = len(pedal)
         for onset, pitch, vel, _ in reversed(
-            list(self.iter_over_notes())
+            list(self.iter_over_notes_unpack())
         ):  # TODO: handle offsets if there are ones
             pitch -= 21  # midi number to piano
             while i > 0 and pedal[i - 1] > onset:
@@ -264,7 +298,7 @@ class PianoRoll:
         size = [length, n_features]
         piano_roll = torch.zeros(size)
 
-        for time, pitch, vel, _ in self.iter_over_notes():
+        for time, pitch, vel, _ in self.iter_over_notes_unpack():
             rel_time = time - start_time
             # only contain notes between start_time and end_time
             if rel_time < 0:
@@ -307,7 +341,7 @@ class PianoRoll:
         ]
         midi.tempo_changes.append(miditoolkit.TempoChange(bpm, 0))
         for i, notes in enumerate(instrs):
-            for onset, pitch, vel, offset in self.iter_over_notes(notes):
+            for onset, pitch, vel, offset in self.iter_over_notes_unpack(notes):
                 assert offset is not None, "Offset not found"
                 midi.instruments[i].notes.append(
                     miditoolkit.Note(
@@ -434,7 +468,7 @@ class PianoRoll:
         Convert the pianoroll to a image
         """
         img = np.zeros((88, self.duration))
-        for time, pitch, vel, offset in self.iter_over_notes():
+        for time, pitch, vel, offset in self.iter_over_notes_unpack():
             img[pitch - 21, time] = vel
         # enlarge the image
         img = np.repeat(img, 8, axis=0)
@@ -461,7 +495,7 @@ class PianoRoll:
         length = end_time - start_time
         sliced_notes = []
         sliced_pedal = []
-        for time, pitch, vel, offset in self.iter_over_notes():
+        for time, pitch, vel, offset in self.iter_over_notes_unpack():
             rel_time = time - start_time
             if rel_time < 0:
                 continue
@@ -520,9 +554,9 @@ class PianoRoll:
         Get the chord sequence of the pianoroll
         """
         chords = []
-        for bar in self.iter_over_bars(granularity):
+        for bar in self.iter_over_bars_unpack(granularity):
             chroma = [0] * 12
-            for time, pitch, vel, offset in bar.iter_over_notes():
+            for time, pitch, vel, offset in bar:
                 chroma[pitch % 12] += 1
             chord = chroma_to_chord(chroma)
             chords.append(chord)
@@ -533,11 +567,11 @@ class PianoRoll:
         Get the polyphony of the pianoroll
         """
         polyphony = []
-        for bar in self.iter_over_bars(granularity):
+        for bar in self.iter_over_bars_unpack(granularity):
             to_be_reduced = []
             last_note_frame = 0
             poly = 0
-            for frame, pitch, vel, offset in bar.iter_over_notes():
+            for frame, pitch, vel, offset in bar:
                 if frame > last_note_frame:
                     to_be_reduced.append(poly)
                     last_note_frame = frame
@@ -555,9 +589,9 @@ class PianoRoll:
         Get the density of the pianoroll
         """
         density = []
-        for bar in self.iter_over_bars(granularity):
+        for bar in self.iter_over_bars_unpack(granularity):
             frames = set()
-            for frame, pitch, vel, offset in bar.iter_over_notes():
+            for frame, pitch, vel, offset in bar:
                 frames.add(frame)
             density.append(len(frames))
         return density
@@ -567,10 +601,10 @@ class PianoRoll:
         Get the velocity of the pianoroll. Average velocity of each bar
         """
         velocity = []
-        for bar in self.iter_over_bars(granularity):
+        for bar in self.iter_over_bars_unpack(granularity):
             vel_sum = 0
             count = 0
-            for frame, pitch, vel, offset in bar.iter_over_notes():
+            for frame, pitch, vel, offset in bar:
                 vel_sum += vel
                 count += 1
             if count == 0:

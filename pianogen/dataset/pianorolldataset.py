@@ -36,10 +36,9 @@ class PianoRollDataset(Dataset):
         segment_len=0,
         hop_len=32,
         max_duration=32 * 180,
-        shard=0,
-        num_shards=1,
         max_pieces=None,
     ):
+        self.segment_length = segment_len
         print(f"Creating dataset segment_len = {segment_len}")
 
         if not isinstance(data_dir, Path):
@@ -54,38 +53,36 @@ class PianoRollDataset(Dataset):
         file_list = list((data_dir / "pianoroll").glob("*.json"))
         file_list = file_list[:max_pieces]
 
-        self.segment_length = segment_len
+        self.sample_to_song: list[tuple[int, int, int]] = []  # song_idx, start, end
         if segment_len:
             num_segments = [
                 ceil(duration / hop_len)
                 for duration in self.attr.get_attribute_file("duration")
             ]
 
-            self.segment_to_song: list[tuple[int, int, int]] = []
             for pr_idx, num_seg in enumerate(num_segments):
-                self.segment_to_song += [
+                self.sample_to_song += [
                     (pr_idx, hop_len * i, hop_len * i + segment_len)
                     for i in range(num_seg)
                 ]
-            # slice shard
-            self.segment_to_song = self.segment_to_song[shard:][::num_shards]
-            self.length = len(self.segment_to_song)
         else:
-            self.length = len(file_list)
-            self.max_duration = min(
-                max_duration, max(self.attr.get_attribute_file("duration"))
-            )
+            self.max_duration = max_duration
+            # do not include songs longer than max_duration
+            for i in range(len(file_list)):
+                duration = self.attr.get_attribute("duration", i)
+                if duration <= max_duration:
+                    self.sample_to_song.append((i, 0, duration))
 
-        print(
-            f"Created dataset with {self.length} data points from {len(file_list)} songs"
-        )
+        self.length = len(self.sample_to_song)
+
+        print(f"Created dataset with {self.length} samples from {len(file_list)} songs")
 
     def __len__(self):
         return self.length
 
     def __getitem__(self, idx) -> torch.Tensor:
         if self.segment_length:
-            song_idx, start, end = self.segment_to_song[idx]
+            song_idx, start, end = self.sample_to_song[idx]
             return PianoRoll.load(
                 self.data_dir / "pianoroll" / f"{song_idx}.json"
             ).to_tensor(start, end, padding=True, normalized=False)
@@ -96,7 +93,7 @@ class PianoRollDataset(Dataset):
 
     def get_piano_roll(self, idx) -> PianoRoll:
         if self.segment_length:
-            piece, start, end = self.segment_to_song[idx]
+            piece, start, end = self.sample_to_song[idx]
             return PianoRoll.load(self.data_dir / "pianoroll" / f"{piece}.json").slice(
                 start, end
             )
