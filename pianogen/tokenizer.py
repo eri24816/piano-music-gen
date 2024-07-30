@@ -28,7 +28,7 @@ class PianoRollTokenizer:
             ]
         )
 
-    def tokenize(self, pr: PianoRoll) -> list[dict]:
+    def tokenize(self, pr: PianoRoll, pad: bool = True) -> list[dict]:
         """
         Convert a PianoRoll to a list of tokens.
         """
@@ -36,7 +36,7 @@ class PianoRollTokenizer:
             pr,
             n_velocity=self.n_velocity,
             duration=self.duration,
-            seq_len=self.token_seq_len,
+            seq_len=self.token_seq_len if pad else None,
             seq_len_per_bar=self.token_seq_len_per_bar,
         )
 
@@ -55,13 +55,21 @@ class PianoRollTokenizer:
     def __getitem__(self, token: int | dict) -> dict | int:
         return self.vocab[token]
 
-    def get_frame_indices(self, tokens: list[dict], shift=0):
+    def get_frame_indices(self, tokens: list[dict], shift=0, infer_next_frame=False):
+        """
+        input: L
+        output:
+            if infer_next_frame: L + 1
+            else: L
+        """
         frame = shift
         result = []
         for token in tokens:
             result.append(frame)
             if token["type"] == "next_frame":
                 frame += 1
+        if infer_next_frame:
+            result.append(frame)
         return torch.tensor(result, dtype=torch.long)
 
     def get_output_mask(self, tokens: list[dict]) -> torch.Tensor:
@@ -131,6 +139,7 @@ def tokenize_raw(
     duration: int | None = None,
     seq_len: int | None = None,
 ):
+    print(duration)
     tokens = []
     frame = 0
     if duration is None:
@@ -149,11 +158,9 @@ def tokenize_raw(
             }
         )
 
-    while duration > frame:
+    while duration > frame + 1:
         tokens.append({"type": "next_frame"})
         frame += 1
-
-    tokens.pop()  # remove the last next_frame 128
 
     if seq_len is not None:
         tokens = tokens[:seq_len]
