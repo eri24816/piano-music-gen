@@ -1,9 +1,8 @@
-from __future__ import annotations
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 import random
-from typing import Generator
+from typing import Generator, Tuple
 from matplotlib import pyplot as plt
 import numpy as np
 from math import ceil
@@ -65,7 +64,7 @@ def chroma_to_chord(query):
         for i in chroma:
             score += query[i]
         scores[chord] = score / len(chroma)
-    argmax = max(scores, key=scores.get)
+    argmax = max(scores, key=scores.__getitem__)
     return argmax
 
 
@@ -488,7 +487,7 @@ class PianoRoll:
     ==================
     """
 
-    def slice(self, start_time: int = 0, end_time: int = INF) -> PianoRoll:
+    def slice(self, start_time: int = 0, end_time: int = INF) -> "PianoRoll":
         """
         Slice a pianoroll from start_time to end_time
         """
@@ -533,7 +532,7 @@ class PianoRoll:
         )
         return new_pr
 
-    def random_slice(self, length: int = 128) -> PianoRoll:
+    def random_slice(self, length: int = 128) -> "PianoRoll":
         """
         Randomly slice a pianoroll with length
         """

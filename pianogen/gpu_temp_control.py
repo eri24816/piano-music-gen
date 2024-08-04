@@ -6,7 +6,7 @@ class GPUTempControl:
     def __init__(self, max_temp: float, margin: float):
         self.max_temp = max_temp
         self.margin = margin
-        self.sample_interval = 0.5
+        self.sample_interval = 0.3
         self.last_sample_time = time.time()
 
     def get_temp(self) -> int:
