@@ -1,106 +1,77 @@
-import json
 from math import ceil
-import os
 from pathlib import Path
+from music_data_analysis import Song
 import torch
-from torch.utils.data import Dataset
-
-from pianogen.data.pianoroll import PianoRoll
-
-
-class AttributeManager:
-    def __init__(self, data_dir):
-        self.data_dir = data_dir
-        self.loaded_attributes = {}
-
-    def get_attribute_file(self, attribute_name):
-        if attribute_name in self.loaded_attributes:
-            return self.loaded_attributes[attribute_name]
-        else:
-            file_path = os.path.join(self.data_dir, f"{attribute_name}.json")
-            if not os.path.exists(file_path):
-                raise FileNotFoundError(f"Attribute file {file_path} not found")
-            with open(file_path, "r") as f:
-                self.loaded_attributes[attribute_name] = json.load(f)
-            return self.loaded_attributes[attribute_name]
-
-    def get_attribute(self, attribute_name, song_idx):
-        attribute_file = self.get_attribute_file(attribute_name)
-        return attribute_file[song_idx]
+from torch.utils.data import Dataset as TorchDataset
+from music_data_analysis.data_access import Dataset as MusicDataset
+from music_data_analysis.data.pianoroll import PianoRoll
 
 
-class PianoRollDataset(Dataset):
+class Sample:
+    def __init__(self, song: Song, start: int, end: int):
+        self.song = song
+        self.start = start
+        self.end = end
+        self.duration = end - start
+
+
+class PianoRollDataset(TorchDataset):
     def __init__(
         self,
         data_dir,
         segment_len=0,
         hop_len=32,
         max_duration=32 * 180,
-        max_pieces=None,
     ):
+        self.mds = MusicDataset(Path(data_dir))
         self.segment_length = segment_len
-        print(f"Creating dataset segment_len = {segment_len}")
-
-        if not isinstance(data_dir, Path):
-            data_dir = Path(data_dir)
-        self.data_dir = data_dir
-
-        if not os.path.exists(data_dir):
-            raise FileNotFoundError(f"Data directory {data_dir} not found")
-
-        self.attr = AttributeManager(data_dir / "attr")
-
-        file_list = list((data_dir / "pianoroll").glob("*.json"))
-        file_list = file_list[:max_pieces]
-
-        self.sample_to_song: list[tuple[int, int, int]] = []  # song_idx, start, end
+        self.samples: list[Sample] = []
         if segment_len:
-            num_segments = [
-                ceil(duration / hop_len)
-                for duration in self.attr.get_attribute_file("duration")
-            ]
-
-            for pr_idx, num_seg in enumerate(num_segments):
-                self.sample_to_song += [
-                    (pr_idx, hop_len * i, hop_len * i + segment_len)
+            for song in self.mds.songs():
+                duration = song.read_json("duration")
+                num_seg = ceil(duration / hop_len)
+                self.samples += [
+                    Sample(song, hop_len * i, hop_len * i + segment_len)
                     for i in range(num_seg)
                 ]
+
         else:
             self.max_duration = max_duration
             # do not include songs longer than max_duration
-            for i in range(len(file_list)):
-                duration = self.attr.get_attribute("duration", i)
+            for song in self.mds.songs():
+                duration = song.read_json("duration")
                 if duration <= max_duration:
-                    self.sample_to_song.append((i, 0, duration))
+                    self.samples.append(Sample(song, 0, duration))
 
-        self.length = len(self.sample_to_song)
+        self.length = len(self.samples)
 
-        print(f"Created dataset with {self.length} samples from {len(file_list)} songs")
+        print(f"Loaded {self.length} samples from {len(self.mds)} songs")
 
     def __len__(self):
         return self.length
 
-    def __getitem__(self, idx) -> torch.Tensor:
+    def __getitem__(self, idx: int) -> torch.Tensor:
+        sample = self.samples[idx]
         if self.segment_length:
-            song_idx, start, end = self.sample_to_song[idx]
-            return PianoRoll.load(
-                self.data_dir / "pianoroll" / f"{song_idx}.json"
-            ).to_tensor(start, end, padding=True, normalized=False)
+            return sample.song.read_pianoroll("pianoroll").to_tensor(
+                sample.start, sample.end, padding=True, normalized=False
+            )
         else:
-            return PianoRoll.load(
-                self.data_dir / "pianoroll" / f"{idx}.json"
-            ).to_tensor(0, self.max_duration, padding=True, normalized=False)
+            return sample.song.read_pianoroll("pianoroll").to_tensor(
+                0, self.max_duration, padding=True, normalized=False
+            )
 
-    def get_piano_roll(self, idx) -> PianoRoll:
+    def get_piano_roll(self, idx: int) -> PianoRoll:
+        sample = self.samples[idx]
         if self.segment_length:
-            piece, start, end = self.sample_to_song[idx]
-            return PianoRoll.load(self.data_dir / "pianoroll" / f"{piece}.json").slice(
-                start, end
+            return sample.song.read_pianoroll("pianoroll").slice(
+                sample.start, sample.end
             )
         else:
-            return PianoRoll.load(self.data_dir / "pianoroll" / f"{idx}.json").slice(
-                0, self.max_duration
-            )
+            return sample.song.read_pianoroll("pianoroll").slice(0, self.max_duration)
+
+    def get_sample(self, idx: int) -> Sample:
+        return self.samples[idx]
 
     def get_all_piano_rolls(self) -> list[PianoRoll]:
         return [self.get_piano_roll(i) for i in range(len(self))]

@@ -1,12 +1,12 @@
 from torch.utils.data import Dataset
-from pianogen.dataset.pianorolldataset import PianoRollDataset
+from pianogen.dataset.pianorolldataset import PianoRollDataset, Sample
 from pianogen.tokenizer import PianoRollTokenizer
-
 
 class TokenizedPianoRollDataset(Dataset):
     """
-    Input: [pitch(n_pitch), velocity(n_velocity), next_frame(1), start(1), pos, target_pos]
-    Output: [pitch(n_pitch), velocity(n_velocity), next_frame(1)]
+    indices: [L]
+    pos: [L]
+    features: [L, D]
     """
 
     def __init__(
@@ -20,6 +20,16 @@ class TokenizedPianoRollDataset(Dataset):
     def __len__(self):
         return len(self.ds)
 
+    def collect_features(self, sample: Sample):
+        song = sample.song
+        features = [
+            song.read_json("chords")[sample.start // 16 : sample.end // 16],
+            song.read_json("note_density")[sample.start // 32 : sample.end // 32],
+            song.read_json("polyphony")[sample.start // 32 : sample.end // 32],
+            song.read_json("highest_pitch")[sample.start // 32 : sample.end // 32],
+            song.read_json("lowest_pitch")[sample.start // 32 : sample.end // 32],
+        ]
+
     def __getitem__(self, idx):
         pr = self.ds.get_piano_roll(idx)
         tokens = self.tokenizer.tokenize(pr)
@@ -30,4 +40,12 @@ class TokenizedPianoRollDataset(Dataset):
 
         output_mask = self.tokenizer.get_output_mask(tokens[:-1])
 
-        return {"indices": indices, "pos": pos, "output_mask": output_mask}
+        sample = self.ds.get_sample(idx)
+        features = self.collect_features(sample)
+
+        return {
+            "indices": indices,
+            "pos": pos,
+            "features": features,
+            "output_mask": output_mask,
+        }

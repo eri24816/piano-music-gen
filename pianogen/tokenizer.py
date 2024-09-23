@@ -1,5 +1,5 @@
 import torch
-from pianogen.data.pianoroll import Note, PianoRoll
+from music_data_analysis.data import Note, PianoRoll
 from pianogen.data.vocab import Vocabulary, WordArray
 
 
