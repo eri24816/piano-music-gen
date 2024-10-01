@@ -171,7 +171,6 @@ class SelectiveAttnTransformer(nn.Module):
             x = x[:, :L - (L % self.segment_len)] # B, L - (L % segment_len), D
 
             x = self.downsample(x.transpose(1, 2)).transpose(1, 2)
-
             x = self.transformer(x, mask = nn.Transformer.generate_square_subsequent_mask(x.shape[1]).to(x.device), is_causal = True)
             x = self.upsample(x.transpose(1, 2)).transpose(1, 2) # B, L - (L % segment_len), D
 
@@ -185,7 +184,6 @@ class SelectiveAttnTransformer(nn.Module):
 
 
         x = self.out_local_attention(x)
-        x = F.leaky_relu(x)
         x = self.out_linear(x)
         return x
     

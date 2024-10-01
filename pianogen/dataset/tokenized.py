@@ -29,7 +29,8 @@ class TokenizedPianoRollDataset(Dataset):
             song.read_json("highest_pitch")[sample.start // 32 : sample.end // 32],
             song.read_json("lowest_pitch")[sample.start // 32 : sample.end // 32],
         ]
-
+        return {} # TODO
+        
     def __getitem__(self, idx):
         pr = self.ds.get_piano_roll(idx)
         tokens = self.tokenizer.tokenize(pr)

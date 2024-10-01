@@ -4,7 +4,7 @@ from music_data_analysis import Song
 import torch
 from torch.utils.data import Dataset as TorchDataset
 from music_data_analysis.data_access import Dataset as MusicDataset
-from music_data_analysis.data.pianoroll import PianoRoll
+from music_data_analysis.data.pianoroll import Pianoroll
 
 
 class Sample:
@@ -61,7 +61,7 @@ class PianoRollDataset(TorchDataset):
                 0, self.max_duration, padding=True, normalized=False
             )
 
-    def get_piano_roll(self, idx: int) -> PianoRoll:
+    def get_piano_roll(self, idx: int) -> Pianoroll:
         sample = self.samples[idx]
         if self.segment_length:
             return sample.song.read_pianoroll("pianoroll").slice(
@@ -73,5 +73,5 @@ class PianoRollDataset(TorchDataset):
     def get_sample(self, idx: int) -> Sample:
         return self.samples[idx]
 
-    def get_all_piano_rolls(self) -> list[PianoRoll]:
+    def get_all_piano_rolls(self) -> list[Pianoroll]:
         return [self.get_piano_roll(i) for i in range(len(self))]

@@ -1,5 +1,6 @@
+from typing import Literal
 import torch
-from music_data_analysis.data import Note, PianoRoll
+from music_data_analysis.data import Note, Pianoroll
 from pianogen.data.vocab import Vocabulary, WordArray
 
 
@@ -8,15 +9,11 @@ class PianoRollTokenizer:
         self,
         n_pitch,
         n_velocity,
-        duration=None,
         token_seq_len=None,
-        token_seq_len_per_bar=None,
     ):
         self.n_pitch = n_pitch
         self.n_velocity = n_velocity
-        self.duration = duration
         self.token_seq_len = token_seq_len
-        self.token_seq_len_per_bar = token_seq_len_per_bar
         self.vocab = Vocabulary(
             [
                 "pad",
@@ -28,21 +25,19 @@ class PianoRollTokenizer:
             ]
         )
 
-    def tokenize(self, pr: PianoRoll, pad: bool = True) -> list[dict]:
+    def tokenize(self, pr: Pianoroll, pad: bool = True) -> list[dict]:
         """
-        Convert a PianoRoll to a list of tokens.
+        Convert a Pianoroll to a list of tokens.
         """
         return tokenize(
             pr,
             n_velocity=self.n_velocity,
-            duration=self.duration,
             seq_len=self.token_seq_len if pad else None,
-            seq_len_per_bar=self.token_seq_len_per_bar,
         )
 
-    def detokenize(self, tokens: list[dict]) -> PianoRoll:
+    def detokenize(self, tokens: list[dict]) -> Pianoroll:
         """
-        Convert a list of tokens to a PianoRoll.
+        Convert a list of tokens to a Pianoroll.
         """
         return detokenize(tokens, self.n_velocity)
 
@@ -51,6 +46,12 @@ class PianoRollTokenizer:
 
     def idx_to_token(self, idx: int) -> dict:
         return self.vocab.get_token(idx)
+    
+    def token_to_idx_seq(self, tokens: list[dict]) -> list[int]:
+        return [self.token_to_idx(token) for token in tokens]
+    
+    def idx_to_token_seq(self, indices: list[int]) -> list[dict]:
+        return [self.idx_to_token(idx) for idx in indices]
 
     def __getitem__(self, token: int | dict) -> dict | int:
         return self.vocab[token]
@@ -75,81 +76,64 @@ class PianoRollTokenizer:
     def get_output_mask(self, tokens: list[dict]) -> torch.Tensor:
         return get_output_mask(self.vocab, tokens)
 
-    def sample_from_logits(self, logits: torch.Tensor, last_token: dict) -> dict:
+    def sample_from_logits(self, logits: torch.Tensor, last_token: dict, top_k: int = 15, p: float = 0.9, method: Literal["top_k", "nucleus"] = "nucleus") -> dict:
         # apply output mask
         mask = self.get_output_mask([last_token]).squeeze(0)
         mask = mask.expand_as(logits)
         logits += mask
-        idx = sample_from_top_k(logits, 15).item()
+        if method == "top_k":
+            idx = top_k_sampling(logits, top_k).item()
+        elif method == "nucleus":
+            idx = nucleus_sampling(logits, p).item()
+        else:
+            raise ValueError(f"Invalid sampling method: {method}")
         assert isinstance(idx, int)
         return self.idx_to_token(idx)
 
 
-def sample_from_top_k(logits: torch.Tensor, k):
+def top_k_sampling(logits: torch.Tensor, k):
     values, indices = logits.topk(k)
     probs = torch.softmax(values, dim=0)
     selected = torch.multinomial(probs, 1)
     return indices[selected]
 
+def nucleus_sampling(logits: torch.Tensor, p: float):
+    probs = torch.softmax(logits, dim=0)
+    sorted_probs, sorted_indices = torch.sort(probs, dim=0, descending=True)
+    cumulative_probs = torch.cumsum(sorted_probs, dim=0)
+    selected_indices = []
+    selected_probs = []
+    for i in range(len(sorted_probs)):
+        selected_indices.append(sorted_indices[i])
+        selected_probs.append(sorted_probs[i])
+        if cumulative_probs[i] > p:
+            break
+    # sample from selected_indices
+    # normalize selected_probs
+    selected_probs = torch.tensor(selected_probs)
+    selected_probs = selected_probs / torch.sum(selected_probs)
+    selected = torch.multinomial(selected_probs, 1)
+    return selected_indices[selected]
 
 def tokenize(
-    pr: PianoRoll,
+    pr: Pianoroll,
     n_velocity,
-    duration: int | None = None,
     seq_len: int | None = None,
-    seq_len_per_bar: int | None = None,
+    need_end_token: bool = False,
 ):
-    bar_len = 32
 
     tokens = []
 
     tokens.append({"type": "start"})
 
-    if seq_len_per_bar is None:
-        if seq_len is not None:
-            seq_len = seq_len - 1  # start token
-        tokens += tokenize_raw(pr.notes, n_velocity, pr.duration, duration, seq_len)
-
-        # only add end token if the song is finished
-        if tokens[-1]["type"] == "pad":
-            tokens[-1] = {"type": "end"}
-
-    else:
-        for bar in pr.iter_over_bars(bar_len):
-            tokens += tokenize_raw(
-                bar,
-                n_velocity,
-                pr_duration=bar_len,
-                duration=bar_len,
-                seq_len=seq_len_per_bar,
-            )
-
-        if seq_len is not None:
-            if len(tokens) < seq_len:
-                tokens.append({"type": "end"})
-                tokens += [{"type": "pad"}] * (seq_len + 1 - len(tokens))
-
-    return tokens
-
-
-def tokenize_raw(
-    notes: list[Note],
-    n_velocity,
-    pr_duration: int,
-    duration: int | None = None,
-    seq_len: int | None = None,
-):
-    print(duration)
-    tokens = []
+    # fill tokens with notes
     frame = 0
-    if duration is None:
-        duration = pr_duration
-
-    for note in notes:
+    
+    for note in pr.notes:
         while note.onset > frame:
             tokens.append({"type": "next_frame"})
             frame += 1
-
+    
         tokens.append({"type": "pitch", "value": note.pitch - 21})
         tokens.append(
             {
@@ -158,13 +142,16 @@ def tokenize_raw(
             }
         )
 
-    while duration > frame + 1:
+    for _ in range(pr.duration - frame):
         tokens.append({"type": "next_frame"})
-        frame += 1
 
+
+    if need_end_token:
+        tokens.append({"type": "end"})
+    
     if seq_len is not None:
         tokens = tokens[:seq_len]
-
+    
         if len(tokens) < seq_len:
             tokens += [{"type": "pad"}] * (seq_len - len(tokens))
 
@@ -228,4 +215,4 @@ def detokenize(tokens, n_velocity):
             frame += 1
         if token["type"] == "end":
             break
-    return PianoRoll(notes)
+    return Pianoroll(notes)
