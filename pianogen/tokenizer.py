@@ -47,7 +47,7 @@ class PianoRollTokenizer:
         """
         return detokenize(tokens, self.n_velocity)
 
-    def token_to_idx(self, token: dict) -> int:
+    def token_to_idx(self, token: dict|str) -> int:
         return self.vocab.get_idx(token)
 
     def idx_to_token(self, idx: int) -> dict:
@@ -94,6 +94,8 @@ class PianoRollTokenizer:
         result = []
         current_pitch = 0
         for token in tokens:
+            if token == "next_frame" or token == "pad":
+                current_pitch = 0 # reset pitch
             if isinstance(token, dict) and token["type"] == "pitch":
                 current_pitch = token["value"]
             result.append(current_pitch)
@@ -102,7 +104,7 @@ class PianoRollTokenizer:
     def get_output_mask(self, tokens: Sequence[str|dict|None]) -> torch.Tensor:
         return get_output_mask(self.vocab, tokens)
 
-    def sample_from_logits(self, logits: torch.Tensor, last_token: str|dict|None, top_k: int = 15, p: float = 0.9, method: Literal["top_k", "nucleus"] = "nucleus") -> dict:
+    def sample_from_logits(self, logits: torch.Tensor, last_token: str|dict|None, top_k: int = 15, p: float = 0.9, method: Literal["top_k", "nucleus"] = "nucleus") -> dict|str:
         # apply output mask
         mask = self.get_output_mask([last_token]).squeeze(0)
         mask = mask.expand_as(logits)

@@ -81,7 +81,10 @@ class Vocabulary:
         return self._token_to_idx[token]
 
     def get_token(self, idx):
-        return self._idx_to_token[idx]
+        result = self._idx_to_token[idx]
+        if result[0] == "{":
+            return json.loads(result)
+        return result
 
     def __getitem__(self, token):
         if isinstance(token, int):

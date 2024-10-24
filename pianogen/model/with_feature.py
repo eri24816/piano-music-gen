@@ -193,7 +193,7 @@ class ChordFeature(Feature):
             nn.LeakyReLU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.LeakyReLU(),
-            nn.Linear(hidden_dim, len(self.vocab)*4)
+            nn.Linear(hidden_dim, len(self.vocab))
         )
 
         self.embedder = nn.Embedding(len(self.vocab), embed_size//4)
@@ -227,13 +227,15 @@ class ChordFeature(Feature):
     def generate(self, conditions: Dict[str, Any]) -> Tensor:
         '''
         conditions: Dict[str, Tensor] [B, D]
+        Returns:
+            Tensor: [B, 4]
         '''
         B = next(iter(conditions.values())).shape[0]
         condition = torch.cat([conditions[key] for key in conditions], dim=1)
         
         results: list[Tensor] = [] # each is [B, 1]
-        embeds: list[Tensor] = [] # each is [B, 1, 32]
-
+        embeds: list[Tensor] = [] # each is [B, 32]
+        
         for i in range(4):
             inp = torch.cat([
                 condition, # B, D
@@ -244,9 +246,9 @@ class ChordFeature(Feature):
             logits = self.classifier(inp).view(B, -1) # B, out
             new_chord = nucleus_sampling_batch(logits, 0.9) # B
             results.append(new_chord)
-            embeds.append(self.recurrent_embed(new_chord).unsqueeze(1)) # B, 1, 32
+            embeds.append(self.recurrent_embed(new_chord)) # B, 32
 
-        return torch.stack(results, dim=1)
+        return torch.stack(results, dim=1) # B, 4
     
     def embed(self, gt: Tensor) -> Tensor:
         '''
@@ -373,16 +375,16 @@ class PianoRollFeature(Feature):
     
     def get_logits(self, conditions: Dict[str, Any], indices: Tensor, pos_frame: Tensor, pos_pitch: Tensor) -> Tensor:
         '''
-        indices: B, L
+        indices: B, L-1
         pos_frame: B, L (0-31)
-        pos_pitch: B, L (0-self.n_pitch)
+        pos_pitch: B, L-1 (0-self.n_pitch)
         '''
         
         condition = torch.cat([conditions[key] for key in conditions], dim=1) # B, D_cond
         start = self.cond_adapter(condition).unsqueeze(1) # B, 1, D-12
 
         # get the token embeddings. The last token is not needed for the input
-        x = self.input_embedding(indices[:,:-1]) # B, L-1, D-12
+        x = self.input_embedding(indices) # B, L-1, D-12
 
         # prepend the start token
         x = torch.cat([start, x], dim=1) # B, L, D-12
@@ -390,11 +392,11 @@ class PianoRollFeature(Feature):
         # add the positional encoding
         pos_enc_this = self.pe(pos_frame[:,:-1]) # B, L-1, 5
         # pos_enc of start token is zero
-        pos_enc_this = torch.cat([torch.zeros_like(pos_enc_this[:,0:1]), pos_enc_this], dim=1) # B, L, 5
+        pos_enc_this = torch.nn.functional.pad(pos_enc_this, (0,0,1,0,0,0), value=0) # B, L, 5
         pos_enc_next = self.pe(pos_frame) # B, L, 5
 
-        pos_enc_pitch = pos_pitch[:,:-1].unsqueeze(-1).float() / (self.n_pitch - 1) # B, L-1 , 1
-        pos_enc_pitch = torch.cat([torch.zeros_like(pos_enc_pitch[:,0:1]), pos_enc_pitch], dim=1) # B, L, 1
+        pos_enc_pitch = pos_pitch.unsqueeze(-1).float() / (self.n_pitch - 1) # B, L-1 , 1
+        pos_enc_pitch = torch.nn.functional.pad(pos_enc_pitch, (0,0,1,0,0,0), value=0) # B, L, 1
 
         # start token mark
         start_token_mark = torch.zeros_like(x[:,:,0:1]) # B, L, 1
@@ -409,48 +411,70 @@ class PianoRollFeature(Feature):
         return x
     
     def calculate_loss(self, conditions: Dict[str, Any], gt: Dict[str, Any]) -> Tensor:
-        logits = self.get_logits(conditions, gt['indices'], gt['pos_frame'], gt['pos_pitch']) # B, L, out
+        logits = self.get_logits(conditions, gt['indices'][:,:-1], gt['pos_frame'], gt['pos_pitch'][:,:-1]) # B, L, out
         return self.crit((logits+gt['output_mask']).transpose(1,2), gt['indices'])
     
     def generate(self, conditions: Dict[str, Any]):
         device = next(self.parameters()).device
-        indices = torch.zeros(1,0,dtype=torch.long, device=device) # B=1, L=0
-        pos_frame = torch.zeros(1,0,dtype=torch.long, device=device) # B=1, L=0
-        pos_pitch = torch.zeros(1,0,dtype=torch.long, device=device) # B=1, L=0
+        B = next(iter(conditions.values())).shape[0]
+        indices = torch.zeros(B,0,dtype=torch.long, device=device) # B, L=0
+        pos_frame = torch.zeros(B,1,dtype=torch.long, device=device) # B, L=0
+        pos_pitch = torch.zeros(B,0,dtype=torch.long, device=device) # B, L=0
         tokens = []
     
-        last_token = None
+        last_token = [None] * B
 
         max_length = 64 # maximum length
         for _ in tqdm(range(max_length)):
     
-            logits = self.get_logits(conditions, indices, pos_frame, pos_pitch).squeeze(0)[-1].detach().cpu()
-            new_token = self.tokenizer.sample_from_logits(logits, last_token, method='nucleus', p=0.9)
+            logits = self.get_logits(conditions, indices, pos_frame, pos_pitch)[:,-1].detach().cpu()
+            new_token = [self.tokenizer.sample_from_logits(logits[i], last_token[i], method='nucleus', p=0.9) for i in range(B)]
             tokens.append(new_token)
             last_token = new_token
     
             # update indices and pos
     
-            new_token_idx = self.tokenizer.vocab.get_idx(new_token)
-            indices = torch.cat([indices, torch.tensor([[new_token_idx]]).to(device)], dim=-1)
-            if new_token['type'] == 'next_frame':
-                new_pos_frame = pos_frame[0,-1] + 1
-            else:
-                new_pos_frame = pos_frame[0,-1]
-            pos_frame = torch.cat([pos_frame, torch.tensor([[new_pos_frame]]).to(device)], dim=-1)
+            new_pos_frame_batch = []
+            for i in range(B):
+                if pos_frame[i,-1] == 32:
+                    new_token[i] = 'pad' # ignore the token if the frame is full
+                if new_token[i] == 'next_frame':
+                    new_pos_frame = pos_frame[i,-1] + 1
+                else:
+                    new_pos_frame = pos_frame[i,-1]
+                new_pos_frame_batch.append(new_pos_frame)
+            pos_frame = torch.cat([pos_frame, torch.tensor([new_pos_frame_batch]).to(device)], dim=-1)
 
-            if new_token['type'] == 'pitch':
-                new_pos_pitch = new_token['value']
-            else:
-                new_pos_pitch = pos_pitch[0,-1]
-            pos_pitch = torch.cat([pos_pitch, torch.tensor([[new_pos_pitch]]).to(device)], dim=-1)
-    
-            if new_pos_frame >= 32:
+            new_pos_pitch_batch = []
+            for i in range(B):
+                
+                if isinstance(new_token[i], dict) and new_token[i]['type'] == 'pitch':
+                    new_pos_pitch = new_token[i]['value']
+                else:
+                    if pos_pitch.shape[1] == 0:
+                        new_pos_pitch = 0
+                    else:
+                        new_pos_pitch = pos_pitch[i,-1]
+                new_pos_pitch_batch.append(new_pos_pitch)
+            pos_pitch = torch.cat([pos_pitch, torch.tensor([new_pos_pitch_batch]).to(device)], dim=-1)
+
+            new_token_idx = [self.tokenizer.token_to_idx(token) for token in new_token]
+            indices = torch.cat([indices, torch.tensor([new_token_idx]).to(device)], dim=-1)
+
+            # break if all new_pos_frame >= 32
+            if all(x >= 32 for x in new_pos_frame_batch):
                 break
 
+        # pad to self.token_per_bar
+        if len(tokens) % self.token_per_bar != 0:
+            pad_length = self.token_per_bar - len(tokens) % self.token_per_bar
+            indices = torch.cat([indices, 0+torch.zeros(B, pad_length, dtype=torch.long, device=device)], dim=-1)
+            pos_frame = torch.cat([pos_frame, 32+torch.zeros(B, pad_length, dtype=torch.long, device=device)], dim=-1)
+            pos_pitch = torch.cat([pos_pitch, 0+torch.zeros(B, pad_length, dtype=torch.long, device=device)], dim=-1)
+
         return {
-            "indices": indices,
-            "pos_frame": pos_frame,
+            "indices": indices, # B, L
+            "pos_frame": pos_frame[:,1:], # B, L
             "pos_pitch": pos_pitch
         }
     
@@ -486,8 +510,6 @@ class PianoRollFeature(Feature):
 
         # retrieve the first token (the out token)
         return x[:,0] # B, D
-
-        return x
 
 
 def sinusoidal_positional_encoding(length: int, dim: int):
@@ -526,7 +548,6 @@ class Stem(nn.Module):
         Returns:
             Tensor: [B, L, D]
         '''
-        print(x.shape)
         x = self.input_layer(x) + self.pe[:x.shape[1]]
         x = self.transformer(x, mask = nn.Transformer.generate_square_subsequent_mask(x.shape[1]))
         x = self.output_layer(x)
@@ -542,7 +563,9 @@ class Cake(nn.Module):
     def __init__(self, a0_size, max_len:int, dim_model: int, num_layers: int, dim_feedforward: int, num_heads: int=8, dropout: float=0.1):
         super().__init__()
 
-        self.stem = Stem(256+3+256, a0_size, max_len, dim_model, num_layers, dim_feedforward, num_heads, dropout)
+        self.stem_input_dim = 256+3+256
+        self.a0_size = a0_size
+        self.stem = Stem(self.stem_input_dim, a0_size, max_len, dim_model, num_layers, dim_feedforward, num_heads, dropout)
 
         condition_size = {'a0': a0_size}
         self.chord = ChordFeature(256, condition_size.copy(), 128)
@@ -575,8 +598,8 @@ class Cake(nn.Module):
         '''
         # convert all features to embeddings
         
-        gt_feature_merged = {} # gt_feature, but the batch and bar dimensions are merged. [B*L, ...] or Dict[str, Tensor]: [B*L, ...]
-        all_feature_embeds = {} # the embeddings of all features. [B, L, D]
+        gt_feature_merged = OrderedDict() # gt_feature, but the batch and bar dimensions are merged. [B*L, ...] or Dict[str, Tensor]: [B*L, ...]
+        all_feature_embeds = OrderedDict() # the embeddings of all features. [B, L, D]
 
         for feature_name, feature_data in gt_feature.items():
             # merge dimension batch(B) and bar(L) for parallel run of Feature.embed()
@@ -597,20 +620,23 @@ class Cake(nn.Module):
 
             all_feature_embeds[feature_name] = self.features[feature_name].embed(feature_data_merged).view(B, L, -1) # [B, L, D]
 
-        for key, value in all_feature_embeds.items():
-            print(key, value.shape)
         all_feature_embeds_cat = torch.cat([all_feature_embeds[key] for key in all_feature_embeds], dim=2) # [B, L, D]
         a0 = self.stem(all_feature_embeds_cat) # [B, L, a0_size]
 
-        # after the stem, all the features are predicted locally (bar-wise). So we can again merge the batch and bar dimensions
+        # a0 is shifted right by one bar to avoid information leakage from the embedding of the current bar.
+        # the a0 of the first bar is defined to be zero.
+
+        a0 = torch.cat([torch.zeros_like(a0[:,:1]), a0[:,:-1]], dim=1) # [B, L, a0_size]
+
+        # after the stem, all the features are predicted locally (bar-wise). Therefore, from now on,
+        # the batch dimension and the bar dimension are merged.
         B, L = a0.shape[:2]
 
         a0 = a0.view(B*L, -1)
 
         # accumulate the loss of predicting each feature
 
-        conditions = {'a0': a0} # the global information
-
+        conditions = OrderedDict(a0=a0) # the global information
         losses = {}
         for feature_name, feature_model in self.features.items():
             # calculate the loss of the feature based on the current conditions
@@ -626,4 +652,33 @@ class Cake(nn.Module):
         return losses
 
     
+    def generate(self, n_bars: int, batch_size: int=1) -> Dict[str, Tensor]:
+        device = next(self.parameters()).device
+        history: Tensor = torch.zeros(batch_size, 0, self.stem_input_dim,device=device) # [B, L=0, D]
 
+        for _ in range(n_bars):
+            if history.shape[1] == 0:
+                # a0 of the first bar is zero
+                a0 = torch.zeros(batch_size, 1, self.a0_size, device=device) # [B, 1, a0_size]
+            else:
+                a0 = self.stem(history) # [B, L, a0_size]
+    
+            a0 = a0[:,-1] # [B, a0_size]
+
+            # generate the features
+            conditions = OrderedDict(a0=a0)
+            generated = {}
+            for feature_name, feature_model in self.features.items():
+                generated[feature_name] = feature_model.generate(conditions)
+
+                for feature_name, feature_data in generated.items():
+                    conditions[feature_name] = self.features[feature_name].embed(feature_data)
+
+            embeds = conditions.copy()
+            embeds.pop('a0')
+
+            embeds_cat = torch.cat([embeds[key] for key in embeds], dim=1) # [B, D]
+            embeds_cat = embeds_cat.unsqueeze(1) # [B, 1, D]
+            history = torch.cat([history, embeds_cat], dim=1) # [B, L+1, D]
+
+        return generated
