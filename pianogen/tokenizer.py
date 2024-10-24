@@ -30,13 +30,13 @@ class PianoRollTokenizer:
         """
         Convert a Pianoroll to a list of tokens.
         """
-        if token_seq_len is not None:
+        if self.token_seq_len is not None:
             if pad:
                 token_seq_len = self.token_seq_len
         return tokenize(
             pr,
             n_velocity=self.n_velocity,
-            seq_len=self.token_seq_len,
+            seq_len=token_seq_len,
             token_per_bar=token_per_bar,
             need_end_token=need_end_token,
         ) 
@@ -123,6 +123,7 @@ def top_k_sampling(logits: torch.Tensor, k):
     selected = torch.multinomial(probs, 1)
     return indices[selected]
 
+
 def nucleus_sampling(logits: torch.Tensor, p: float):
     probs = torch.softmax(logits, dim=0)
     sorted_probs, sorted_indices = torch.sort(probs, dim=0, descending=True)
@@ -141,6 +142,13 @@ def nucleus_sampling(logits: torch.Tensor, p: float):
     selected = torch.multinomial(selected_probs, 1)
     return selected_indices[selected]
 
+def nucleus_sampling_batch(logits: torch.Tensor, p: float):
+    assert logits.dim() == 2, "logits must be 2D tensor"
+    result = []
+    for i in range(logits.size(0)):
+        result.append(nucleus_sampling(logits[i], p))
+    return torch.stack(result)
+
 def tokenize(
     pr: Pianoroll,
     n_velocity,
@@ -148,7 +156,6 @@ def tokenize(
     token_per_bar: int | None = None,
     need_end_token: bool = False,
 ):
-    
     if token_per_bar is not None:
         tokens = []
         for bar in pr.iter_over_bars_pr():
@@ -169,8 +176,6 @@ def tokenize(
         return tokens
 
     tokens = []
-
-    tokens.append("start")
 
     # fill tokens with notes
     frame = 0
