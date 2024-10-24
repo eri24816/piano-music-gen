@@ -92,22 +92,35 @@ class Feature(nn.Module, Generic[T]):
         raise NotImplementedError
 
 class ScalarLoader(FeatureLoader):
-    def __init__(self, file_name: str, granularity: int):
+    def __init__(self, file_name: str, time_granularity: int, vmin: float, vmax: float, num_classes: int):
         self.file_name = file_name
-        self.granularity = granularity
+        self.time_granularity = time_granularity
+        self.vmin = vmin
+        self.vmax = vmax
+        self.num_classes = num_classes
 
     def load(self, sample: Sample, pad_to: int) -> Tensor:
-        return torch.tensor(sample.get_feature_slice(self.file_name, self.granularity, pad_to=pad_to // self.granularity))
+        scalars = torch.tensor(sample.get_feature_slice(self.file_name, self.time_granularity, pad_to=pad_to // self.time_granularity))
+        
+        indices = ((scalars - self.vmin) / (self.vmax - self.vmin) * self.num_classes).long()
+        indices = torch.clamp(indices, 0, self.num_classes-1)
+        return indices
 
 class ScalarFeature(Feature[Tensor]):
     '''
     data_type: Tensor
     '''
-    def __init__(self, condition_size: Dict[str,int], num_classes: int, hidden_dim: int, file_name: str, granularity: int):
+    def __init__(self, condition_size: Dict[str,int], hidden_dim: int, file_name: str, time_granularity: int,
+                    vmin: float, vmax: float, num_classes: int):
         super().__init__(1, condition_size)
 
         self.file_name = file_name
-        self.granularity = granularity
+        self.granularity = time_granularity
+
+        self.vmin = vmin
+        self.vmax = vmax
+        self.num_classes = num_classes
+
 
         cond_size = sum(condition_size.values()) # use all conditions
         
@@ -120,7 +133,7 @@ class ScalarFeature(Feature[Tensor]):
         )
 
     def get_loader(self):
-        return ScalarLoader(self.file_name, self.granularity)
+        return ScalarLoader(self.file_name, self.granularity, self.vmin, self.vmax, self.num_classes)
 
     def get_logits(self, conditions: Dict[str, Any]) -> Tensor:
         condition = torch.cat([conditions[key] for key in conditions], dim=1)
@@ -173,6 +186,14 @@ class ChordFeature(Feature):
     def get_loader(self) -> FeatureLoader:
         return ChordLoader(self.vocab)
     
+    def get_logits(self, conditions: Dict[str, Any]) -> Tensor:
+        condition = torch.cat([conditions[key] for key in conditions], dim=1)
+        return self.classifier(condition)
+    
+    def calculate_loss(self, conditions: Dict[str, Any], gt: Tensor) -> Tensor:
+        logits = self.get_logits(conditions)
+        return nn.CrossEntropyLoss()(logits, gt)
+    
 class BinaryPositionalEncoding(nn.Module):
     '''
     Input: B, L (long)
@@ -205,7 +226,18 @@ class PianoRollLoader(FeatureLoader):
         }
 
 class PianoRollFeature(Feature):
-    def __init__(self, embed_size: int, condition_size: Dict[str, int], token_per_bar:int=64, hidden_dim: int=256, num_layers: int=6, n_pitch: int=88, n_velocity: int=32):
+    def __init__(self, 
+        embed_size: int,
+        condition_size: Dict[str, int],
+        token_per_bar:int=64,
+        hidden_dim: int=256,
+        num_layers: int=6,
+        n_pitch: int=88,
+        n_velocity: int=32,
+
+        embed_num_layers: int=3,
+        embed_hidden_dim: int=256,
+    ):
         super().__init__(embed_size, condition_size)
         self.token_per_bar = token_per_bar
         self.n_pitch = n_pitch
@@ -221,10 +253,12 @@ class PianoRollFeature(Feature):
         hidden_dim - 12 for the token embedding or the condition content
         '''
         
+        self.pe = BinaryPositionalEncoding(5, token_per_bar)
+
+        # for prediction
         cond_size = sum(condition_size.values()) # use all conditions
         self.cond_adapter = nn.Linear(cond_size, hidden_dim - 12)
         self.input_embedding = nn.Embedding(len(self.tokenizer.vocab), hidden_dim - 12)
-        self.pe = BinaryPositionalEncoding(5, token_per_bar)
 
         self.transformer = nn.TransformerEncoder(
             nn.TransformerEncoderLayer(d_model=hidden_dim, nhead=8, dim_feedforward=1024, batch_first=True),
@@ -233,6 +267,15 @@ class PianoRollFeature(Feature):
         self.output_layer = nn.Linear(hidden_dim, len(self.tokenizer.vocab))
 
         self.crit = nn.CrossEntropyLoss(ignore_index=0)
+
+
+        # for embedding
+        self.embed_embedding = nn.Embedding(len(self.tokenizer.vocab), hidden_dim - 6)
+        self.embed_transformer = nn.TransformerEncoder(
+            nn.TransformerEncoderLayer(d_model=embed_hidden_dim, nhead=8, dim_feedforward=256, batch_first=True),
+            num_layers=embed_num_layers
+        )
+        self.embed_output_layer = nn.Linear(hidden_dim, embed_size)
     
     def get_loader(self) -> FeatureLoader:
         return PianoRollLoader(self.tokenizer, self.token_per_bar)
@@ -241,7 +284,7 @@ class PianoRollFeature(Feature):
         '''
         indices: B, L
         pos_frame: B, L (0-31)
-        pos_token: B, L (0-self.n_pitch)
+        pos_pitch: B, L (0-self.n_pitch)
         '''
         
         condition = torch.cat([conditions[key] for key in conditions], dim=1)
@@ -259,7 +302,7 @@ class PianoRollFeature(Feature):
         pos_enc_this = torch.cat([torch.zeros_like(pos_enc_this[:,0:1]), pos_enc_this], dim=1) # B, L, 5
         pos_enc_next = self.pe(pos_frame) # B, L, 5
 
-        pos_enc_pitch = pos_pitch.unsqueeze(-1).float() / (self.n_pitch - 1) # B, L-1 , 1
+        pos_enc_pitch = pos_pitch[:-1].unsqueeze(-1).float() / (self.n_pitch - 1) # B, L-1 , 1
         pos_enc_pitch = torch.cat([torch.zeros_like(pos_enc_pitch[:,0:1]), pos_enc_pitch], dim=1) # B, L, 1
 
         # start token mark
@@ -278,7 +321,7 @@ class PianoRollFeature(Feature):
         logits = self.get_logits(conditions, gt['indices'], gt['pos_frame'], gt['pos_pitch'])
         return self.crit((logits+gt['output_mask']).transpose(1,2), gt['indices'])
     
-    def generate(self, conditions: Dict[str, Any]) -> torch.Tensor:
+    def generate(self, conditions: Dict[str, Any]):
         device = next(self.parameters()).device
         indices = torch.zeros(1,0,dtype=torch.long, device=device) # B=1, L=0
         pos_frame = torch.zeros(1,0,dtype=torch.long, device=device) # B=1, L=0
@@ -317,10 +360,36 @@ class PianoRollFeature(Feature):
         return {
             "indices": indices,
             "pos_frame": pos_frame,
-            "pos_pitch": pos_pitch,
-            "tokens": tokens
+            "pos_pitch": pos_pitch
         }
-                                 
+    
+    def embed(self, gt) -> Tensor:
+        '''
+        indices: B, L
+        pos_frame: B, L (0-31)
+        pos_token: B, L (0-self.n_pitch)
+        '''
+
+        indices = gt['indices']
+        pos_frame = gt['pos_frame']
+        pos_pitch = gt['pos_pitch']
+
+        x = self.embed_embedding(indices) # B, L, D-6
+
+        # add the positional encoding
+        pos_enc_frame = self.pe(pos_frame) # B, L, 5
+
+        pos_enc_pitch = pos_pitch.unsqueeze(-1).float() / (self.n_pitch - 1) # B, L-1 , 1
+
+        x = torch.cat([pos_enc_frame, pos_enc_pitch, x], dim=-1) # B, L, D
+
+        x = self.embed_transformer(x)
+
+        x = self.embed_output_layer(x) # B, L, out
+
+        return x
+
+
 def sinusoidal_positional_encoding(length: int, dim: int):
     res = []
     for d in range(dim // 2):
@@ -365,11 +434,14 @@ class Cake(nn.Module):
         condition_size = {'a0': a0_size}
         self.chord = ChordFeature(64, condition_size.copy(), 128)
         condition_size['chord'] = 64
-        self.velocity = ScalarFeature(condition_size.copy(), 128, dim_model, 'velocity', 32)
+        self.velocity = ScalarFeature(condition_size.copy(), dim_model, 'velocity', 32,
+            vmin=0, vmax=128, num_classes=32)
         condition_size['velocity'] = 1
-        self.polyphony = ScalarFeature(condition_size.copy(), 128, dim_model , 'polyphony', 32)
+        self.polyphony = ScalarFeature(condition_size.copy(),  dim_model , 'polyphony', 32,
+            vmin=0, vmax=8, num_classes=8)
         condition_size['polyphony'] = 1
-        self.density = ScalarFeature(condition_size.copy(), 128, dim_model , 'note_density', 32)
+        self.density = ScalarFeature(condition_size.copy(), dim_model , 'note_density', 32,
+            vmin=0, vmax=32, num_classes=16)
         condition_size['density'] = 1
         self.piano_roll = PianoRollFeature(256, condition_size.copy(), 64)
         condition_size['piano_roll'] = 256
