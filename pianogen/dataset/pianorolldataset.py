@@ -6,7 +6,8 @@ import torch
 from torch.utils.data import Dataset as TorchDataset
 from music_data_analysis.data_access import Dataset as MusicDataset
 from music_data_analysis.data.pianoroll import Pianoroll
-
+import multiprocessing as mp
+import numpy as np
 
 class Sample:
     def __init__(self, song: Song, start: int, end: int):
@@ -42,15 +43,19 @@ class PianoRollDataset(TorchDataset):
     ):
         self.mds = MusicDataset(Path(data_dir))
         self.segment_length = segment_len
-        self.samples: list[Sample] = []
+
+        # flattened data structure for the samples for faster pickling
+        self.samples_song = []
+        self.samples_start = []
+        self.samples_end = []
+
         if segment_len:
             for song in self.mds.songs():
                 duration = song.read_json("duration")
                 num_seg = ceil(duration / hop_len)
-                self.samples += [
-                    Sample(song, hop_len * i, hop_len * i + segment_len)
-                    for i in range(num_seg)
-                ]
+                self.samples_song += [song] * num_seg
+                self.samples_start += [hop_len * i for i in range(num_seg)]
+                self.samples_end += [hop_len * i + segment_len for i in range(num_seg)]
 
         else:
             self.max_duration = max_duration
@@ -58,9 +63,19 @@ class PianoRollDataset(TorchDataset):
             for song in self.mds.songs():
                 duration = song.read_json("duration")
                 if duration <= max_duration:
-                    self.samples.append(Sample(song, 0, duration))
+                    self.samples_song.append(song)
+                    self.samples_start.append(0)
+                    self.samples_end.append(duration)
 
-        self.length = len(self.samples)
+        self.length = len(self.samples_song)
+
+        # use shared memory for the samples. Otherwise, the pickling of these arrays would be very slow
+        self.samples_start = mp.Array('i', self.samples_start)
+        self.samples_start = np.ctypeslib.as_array(self.samples_start.get_obj())
+        self.samples_start = torch.from_numpy(self.samples_start)
+        self.samples_end = mp.Array('i', self.samples_end)
+        self.samples_end = np.ctypeslib.as_array(self.samples_end.get_obj())
+        self.samples_end = torch.from_numpy(self.samples_end)
 
         print(f"Loaded {self.length} samples from {len(self.mds)} songs")
 
@@ -68,7 +83,7 @@ class PianoRollDataset(TorchDataset):
         return self.length
 
     def __getitem__(self, idx: int) -> torch.Tensor:
-        sample = self.samples[idx]
+        sample = self.get_sample(idx)
         if self.segment_length:
             return sample.song.read_pianoroll("pianoroll").to_tensor(
                 sample.start, sample.end, padding=True, normalized=False
@@ -79,7 +94,7 @@ class PianoRollDataset(TorchDataset):
             )
 
     def get_piano_roll(self, idx: int) -> Pianoroll:
-        sample = self.samples[idx]
+        sample = self.get_sample(idx)
         if self.segment_length:
             return sample.song.read_pianoroll("pianoroll").slice(
                 sample.start, sample.end
@@ -88,7 +103,9 @@ class PianoRollDataset(TorchDataset):
             return sample.song.read_pianoroll("pianoroll").slice(0, self.max_duration)
 
     def get_sample(self, idx: int) -> Sample:
-        return self.samples[idx]
+        return Sample(
+            self.samples_song[idx], self.samples_start[idx], self.samples_end[idx]
+        )
 
     def get_all_piano_rolls(self) -> list[Pianoroll]:
         return [self.get_piano_roll(i) for i in range(len(self))]

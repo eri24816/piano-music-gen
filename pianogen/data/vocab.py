@@ -127,6 +127,9 @@ class Vocabulary:
         positive_value=0,
         negative_value=-1e7,
     ):
+        '''
+        Returns a mask tensor of shape [len(tokens), len(vocab)] with positive_value for tokens in the list and negative_value for the rest.
+        '''
         mask = torch.zeros(len(tokens), len(self))
         mask = mask + negative_value
 

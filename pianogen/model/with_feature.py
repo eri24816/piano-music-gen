@@ -9,6 +9,13 @@ from pianogen.dataset.pianorolldataset import Sample
 from pianogen.pe import binary_positional_encoding
 from pianogen.tokenizer import PianoRollTokenizer
 
+class FeatureLoader:
+    '''
+    Loads a feature from disk.
+    '''
+    def load(self, sample: Sample, pad_to: int) -> Any:
+        raise NotImplementedError
+
 T = TypeVar('T')
 class Feature(nn.Module, Generic[T]):
     '''
@@ -32,17 +39,13 @@ class Feature(nn.Module, Generic[T]):
     def embed_size(self) -> int:
         return self._embed_size
 
-    def load_for_dataset(self, sample: Sample, pad_to: int):
-        '''Load one sample of the feature from disk. Called in the dataset's __getitem__ function.
-
-        Args:
-            sample (Sample): The sample to load the feature from.
-            pad_to (int): The length to pad the feature to.
-
-        Raises:
+    def get_loader(self) -> FeatureLoader:
+        '''Returen a loader that loads one sample of the feature from disk. Called in the dataset's __getitem__ function.
+        The loader should not refer to the Feature object itself because it will be copied to multiple processes
+        by PyTorch DataLoader.
 
         Returns:
-            T: The loaded feature in natural representation.
+            FeatureLoader: The loader that loads the feature from disk.
         '''
         raise NotImplementedError
 
@@ -87,7 +90,15 @@ class Feature(nn.Module, Generic[T]):
             Tensor: The embedded data.
         '''
         raise NotImplementedError
-    
+
+class ScalarLoader(FeatureLoader):
+    def __init__(self, file_name: str, granularity: int):
+        self.file_name = file_name
+        self.granularity = granularity
+
+    def load(self, sample: Sample, pad_to: int) -> Tensor:
+        return torch.tensor(sample.get_feature_slice(self.file_name, self.granularity, pad_to=pad_to // self.granularity))
+
 class ScalarFeature(Feature[Tensor]):
     '''
     data_type: Tensor
@@ -108,8 +119,8 @@ class ScalarFeature(Feature[Tensor]):
             nn.Linear(hidden_dim, num_classes)
         )
 
-    def load_for_dataset(self, sample: Sample, pad_to: int) -> Tensor:
-        return torch.tensor(sample.get_feature_slice(self.file_name, self.granularity, pad_to=pad_to // self.granularity))
+    def get_loader(self):
+        return ScalarLoader(self.file_name, self.granularity)
 
     def get_logits(self, conditions: Dict[str, Any]) -> Tensor:
         condition = torch.cat([conditions[key] for key in conditions], dim=1)
@@ -126,6 +137,16 @@ class ScalarFeature(Feature[Tensor]):
     def embed(self, data: Tensor) -> Tensor:
         return data
 
+class ChordLoader(FeatureLoader):
+
+    def __init__(self, vocab: Vocabulary):
+        self.vocab = vocab
+
+    def load(self, sample: Sample, pad_to: int) -> Tensor:
+        chords = sample.get_feature_slice('chords', 8, pad_to=pad_to//8, pad_value='None')
+        assert isinstance(chords, dict)
+        chords = chords['name']
+        return self.vocab.tokens_to_indices(chords)
 class ChordFeature(Feature):
     
     def __init__(self, embed_size: int, condition_size: Dict[str, int], hidden_dim: int):
@@ -148,13 +169,9 @@ class ChordFeature(Feature):
         )
 
         self.embedder = nn.Embedding(len(self.vocab), embed_size)
-
-    def load_for_dataset(self, sample: Sample, pad_to: int):
-        chords = sample.get_feature_slice('chords', 8, pad_to=pad_to//8, pad_value='None')
-        assert isinstance(chords, dict)
-        chords = chords['name']
-        
-        return self.vocab.tokens_to_indices(chords)
+    
+    def get_loader(self) -> FeatureLoader:
+        return ChordLoader(self.vocab)
     
 class BinaryPositionalEncoding(nn.Module):
     '''
@@ -168,6 +185,24 @@ class BinaryPositionalEncoding(nn.Module):
     def forward(self, pos: torch.Tensor):
         return torch.gather(self.pos_encoding.expand(pos.shape[0], -1, -1), 1, pos.unsqueeze(-1).expand(-1, -1, self.pos_encoding.shape[-1]))
     
+
+class PianoRollLoader(FeatureLoader):
+    def __init__(self, tokenizer: PianoRollTokenizer, token_per_bar:int):
+        self.tokenizer = tokenizer
+        self.token_per_bar = token_per_bar
+
+    def load(self, sample: Sample, pad_to: int) -> Dict[str, Any]:
+        pr = sample.song.read_pianoroll('pianoroll').slice(sample.start, sample.end)
+        tokens = self.tokenizer.tokenize(pr, token_per_bar=self.token_per_bar, token_seq_len=self.token_per_bar*(pad_to//32))
+        indices = self.tokenizer.token_to_idx_seq(tokens)
+        pos = self.tokenizer.get_frame_indices(tokens)
+        output_mask = self.tokenizer.get_output_mask(tokens[:-1])
+        return {
+            "indices": indices,
+            "pos_frame": pos,
+            "pos_pitch": torch.tensor([token['pitch'] for token in tokens]),
+            "output_mask": output_mask,
+        }
 
 class PianoRollFeature(Feature):
     def __init__(self, embed_size: int, condition_size: Dict[str, int], token_per_bar:int=64, hidden_dim: int=256, num_layers: int=6, n_pitch: int=88, n_velocity: int=32):
@@ -198,19 +233,9 @@ class PianoRollFeature(Feature):
         self.output_layer = nn.Linear(hidden_dim, len(self.tokenizer.vocab))
 
         self.crit = nn.CrossEntropyLoss(ignore_index=0)
-
-    def load_for_dataset(self, sample: Sample, pad_to: int):
-        pr = sample.song.read_pianoroll('pianoroll').slice(sample.start, sample.end)        
-        tokens = self.tokenizer.tokenize(pr, token_per_bar=self.token_per_bar, token_seq_len=self.token_per_bar*(pad_to//32))
-        indices = self.tokenizer.token_to_idx_seq(tokens)
-        pos = self.tokenizer.get_frame_indices(tokens)
-        output_mask = self.tokenizer.get_output_mask(tokens[:-1])
-        return {
-            "indices": indices,
-            "pos_frame": pos,
-            "pos_pitch": torch.tensor([token['pitch'] for token in tokens]),
-            "output_mask": output_mask,
-        }
+    
+    def get_loader(self) -> FeatureLoader:
+        return PianoRollLoader(self.tokenizer, self.token_per_bar)
     
     def get_logits(self, conditions: Dict[str, Any], indices: Tensor, pos_frame: Tensor, pos_pitch: Tensor) -> Tensor:
         '''
@@ -251,7 +276,7 @@ class PianoRollFeature(Feature):
     
     def calculate_loss(self, conditions: Dict[str, Any], gt: Dict[str, Any]) -> Tensor:
         logits = self.get_logits(conditions, gt['indices'], gt['pos_frame'], gt['pos_pitch'])
-        return nn.CrossEntropyLoss()(logits, gt['indices'])
+        return self.crit((logits+gt['output_mask']).transpose(1,2), gt['indices'])
     
     def generate(self, conditions: Dict[str, Any]) -> torch.Tensor:
         device = next(self.parameters()).device
@@ -289,7 +314,12 @@ class PianoRollFeature(Feature):
             if new_pos_frame >= 32:
                 break
 
-        return tokens
+        return {
+            "indices": indices,
+            "pos_frame": pos_frame,
+            "pos_pitch": pos_pitch,
+            "tokens": tokens
+        }
                                  
 def sinusoidal_positional_encoding(length: int, dim: int):
     res = []

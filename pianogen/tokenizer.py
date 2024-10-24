@@ -1,4 +1,4 @@
-from typing import Literal
+from typing import Literal, Sequence
 import torch
 from music_data_analysis.data import Note, Pianoroll
 from pianogen.data.vocab import Vocabulary, WordArray
@@ -99,7 +99,7 @@ class PianoRollTokenizer:
             result.append(current_pitch)
         return torch.tensor(result, dtype=torch.long)
 
-    def get_output_mask(self, tokens: list[str|dict|None]) -> torch.Tensor:
+    def get_output_mask(self, tokens: Sequence[str|dict|None]) -> torch.Tensor:
         return get_output_mask(self.vocab, tokens)
 
     def sample_from_logits(self, logits: torch.Tensor, last_token: str|dict|None, top_k: int = 15, p: float = 0.9, method: Literal["top_k", "nucleus"] = "nucleus") -> dict:
@@ -204,7 +204,7 @@ def tokenize(
     return tokens
 
 
-def get_output_mask(vocab: Vocabulary, tokens: list[str|dict|None]) -> torch.Tensor:
+def get_output_mask(vocab: Vocabulary, tokens: Sequence[str|dict|None]) -> torch.Tensor:
     """
     An additive mask for the model's output (logits) to prevent the model from predicting invalid tokens.
 

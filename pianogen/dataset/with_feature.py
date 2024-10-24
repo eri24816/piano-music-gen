@@ -16,15 +16,19 @@ class FeatureDataset(Dataset):
         features: Dict[str, Feature],
     ):
         self.ds = piano_roll_dataset
-        self.features = features
+
+        # Avoid reference to the Feature objects to prevent copying neural networks inside the Feature objects.
+        self.loaders = {
+            name: feature.get_loader() for name, feature in features.items()
+        }
 
     def __len__(self):
         return len(self.ds)
 
     def collect_features(self, sample: Sample, pad_to: int):
         features = {}
-        for name, feature in self.features.items():
-            features[name] = feature.load_for_dataset(sample, pad_to)
+        for name, loader in self.loaders.items():
+            features[name] = loader.load(sample, pad_to)
         return features
         
     def __getitem__(self, idx):
