@@ -22,13 +22,13 @@ class TokenizedPianoRollDataset(Dataset):
 
     def collect_features(self, sample: Sample):
         song = sample.song
-        features = [
-            song.read_json("chords")[sample.start // 16 : sample.end // 16],
-            song.read_json("note_density")[sample.start // 32 : sample.end // 32],
-            song.read_json("polyphony")[sample.start // 32 : sample.end // 32],
-            song.read_json("highest_pitch")[sample.start // 32 : sample.end // 32],
-            song.read_json("lowest_pitch")[sample.start // 32 : sample.end // 32],
-        ]
+        # features = [
+        #     song.read_json("chords")[sample.start // 16 : sample.end // 16],
+        #     song.read_json("note_density")[sample.start // 32 : sample.end // 32],
+        #     song.read_json("polyphony")[sample.start // 32 : sample.end // 32],
+        #     song.read_json("highest_pitch")[sample.start // 32 : sample.end // 32],
+        #     song.read_json("lowest_pitch")[sample.start // 32 : sample.end // 32],
+        # ]
         return {} # TODO
         
     def __getitem__(self, idx):

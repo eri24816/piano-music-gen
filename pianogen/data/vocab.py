@@ -6,8 +6,8 @@ import torch
 
 
 class WordArray:
-    def __init__(self, type, dimensions: dict[str, Sequence]):
-        self.type = type
+    def __init__(self, name:str, dimensions: dict[str, Sequence]):
+        self.name = name
         self.dimensions = dimensions
         self.length = prod([len(values) for values in dimensions.values()])
         self.token_to_idx = {}
@@ -17,7 +17,6 @@ class WordArray:
 
         for token in itertools.product(*dimensions.values()):
             token = dict(zip(dimensions.keys(), token))
-            token["type"] = type
             self.token_to_idx[json.dumps(token, sort_keys=True)] = i
             self.idx_to_token.append(token)
             i += 1
@@ -30,15 +29,15 @@ class WordArray:
 
 
 class Word:
-    def __init__(self, type: str):
-        self.type = type
-        self.idx_to_token = [type]
+    def __init__(self, name: str):
+        self.name = name
+        self.idx_to_token = [name]
 
     def __len__(self):
         return 1
 
     def tokens(self):
-        return [{"type": self.type}]
+        return [self.name]
 
 
 class Vocabulary:
@@ -46,9 +45,11 @@ class Vocabulary:
     maps tokens to indices and vice versa.
     """
 
-    def __init__(self, vocab: list[str | WordArray | Word]):
+    def __init__(self, vocab: Sequence[str |dict| WordArray | Word]):
         self.vocab: list[WordArray | Word] = []
         for w in vocab:
+            if isinstance(w, dict):
+                w = Word(json.dumps(w, sort_keys=True))
             if isinstance(w, str):
                 w = Word(w)
             self.vocab.append(w)
@@ -59,14 +60,16 @@ class Vocabulary:
 
         for word in self.vocab:
             for token in word.tokens():
-                self._token_to_idx[json.dumps(token, sort_keys=True)] = i
+                if not isinstance(token, str):
+                    token = json.dumps(token, sort_keys=True)
+                self._token_to_idx[token] = i
                 self._idx_to_token[i] = token
                 i += 1
 
         self.token_type_to_range: dict[str, range] = {}
         i = 0
         for word in self.vocab:
-            self.token_type_to_range[word.type] = range(i, i + len(word))
+            self.token_type_to_range[word.name] = range(i, i + len(word))
             i += len(word)
 
     def __len__(self):

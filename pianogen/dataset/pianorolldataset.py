@@ -1,5 +1,6 @@
 from math import ceil
 from pathlib import Path
+from typing import Any
 from music_data_analysis import Song
 import torch
 from torch.utils.data import Dataset as TorchDataset
@@ -14,6 +15,22 @@ class Sample:
         self.end = end
         self.duration = end - start
 
+    def get_feature_slice(self, file_name: str, granularity: int, pad_to: int = 0, pad_value: Any = 0):
+        j = self.song.read_json(file_name)
+        if isinstance(j, list):
+            unpadded = j[self.start // granularity : self.end // granularity]
+            if pad_to:
+                return unpadded + [pad_value] * (pad_to - len(unpadded))
+            else:
+                return unpadded
+        else:
+            assert isinstance(j, dict)
+            result = {}
+            for k, v in j.items():
+                result[k] = v[self.start // granularity : self.end // granularity]
+                if pad_to:
+                    result[k] += [pad_value] * (pad_to - len(result[k]))
+            return result
 
 class PianoRollDataset(TorchDataset):
     def __init__(

@@ -17,23 +17,29 @@ class PianoRollTokenizer:
         self.vocab = Vocabulary(
             [
                 "pad",
-                "start",
-                "end",
+                #"start",
+                #"end",
                 "next_frame",
-                WordArray("pitch", {"value": range(n_pitch)}),
-                WordArray("velocity", {"value": range(n_velocity)}),
+                WordArray("pitch", {"type":["pitch"],"value": range(n_pitch)}),
+                WordArray("velocity", {"type":["velocity"],"value": range(n_velocity)}),
             ]
         )
 
-    def tokenize(self, pr: Pianoroll, pad: bool = True) -> list[dict]:
+    def tokenize(self, pr: Pianoroll, pad: bool = True, token_seq_len: int | None = None, token_per_bar: int | None = None, need_end_token: bool = False
+                 ) -> list[dict]:
         """
         Convert a Pianoroll to a list of tokens.
         """
+        if token_seq_len is not None:
+            if pad:
+                token_seq_len = self.token_seq_len
         return tokenize(
             pr,
             n_velocity=self.n_velocity,
-            seq_len=self.token_seq_len if pad else None,
-        )
+            seq_len=self.token_seq_len,
+            token_per_bar=token_per_bar,
+            need_end_token=need_end_token,
+        ) 
 
     def detokenize(self, tokens: list[dict]) -> Pianoroll:
         """
@@ -52,6 +58,17 @@ class PianoRollTokenizer:
     
     def idx_to_token_seq(self, indices: list[int]) -> list[dict]:
         return [self.idx_to_token(idx) for idx in indices]
+    
+    def pr_to_idx(self, pr: Pianoroll, return_pos: bool = False):
+        tokens = self.tokenize(pr, pad=False)
+        if return_pos:
+            return self.token_to_idx_seq(tokens), self.get_frame_indices(tokens)
+        else:
+            return self.token_to_idx_seq(tokens)
+    
+    def idx_to_pr(self, indices: list[int], pos: list[int]) -> Pianoroll:
+        tokens = self.idx_to_token_seq(indices)
+        return detokenize(tokens, self.n_velocity)
 
     def __getitem__(self, token: int | dict) -> dict | int:
         return self.vocab[token]
@@ -67,16 +84,25 @@ class PianoRollTokenizer:
         result = []
         for token in tokens:
             result.append(frame)
-            if token["type"] == "next_frame":
+            if token == "next_frame":
                 frame += 1
         if infer_next_frame:
             result.append(frame)
         return torch.tensor(result, dtype=torch.long)
+    
+    def get_pitch_sequence(self, tokens: list[dict]) -> torch.Tensor:
+        result = []
+        current_pitch = 0
+        for token in tokens:
+            if isinstance(token, dict) and token["type"] == "pitch":
+                current_pitch = token["value"]
+            result.append(current_pitch)
+        return torch.tensor(result, dtype=torch.long)
 
-    def get_output_mask(self, tokens: list[dict]) -> torch.Tensor:
+    def get_output_mask(self, tokens: list[str|dict|None]) -> torch.Tensor:
         return get_output_mask(self.vocab, tokens)
 
-    def sample_from_logits(self, logits: torch.Tensor, last_token: dict, top_k: int = 15, p: float = 0.9, method: Literal["top_k", "nucleus"] = "nucleus") -> dict:
+    def sample_from_logits(self, logits: torch.Tensor, last_token: str|dict|None, top_k: int = 15, p: float = 0.9, method: Literal["top_k", "nucleus"] = "nucleus") -> dict:
         # apply output mask
         mask = self.get_output_mask([last_token]).squeeze(0)
         mask = mask.expand_as(logits)
@@ -119,19 +145,39 @@ def tokenize(
     pr: Pianoroll,
     n_velocity,
     seq_len: int | None = None,
+    token_per_bar: int | None = None,
     need_end_token: bool = False,
 ):
+    
+    if token_per_bar is not None:
+        tokens = []
+        for bar in pr.iter_over_bars_pr():
+            tokens += tokenize(bar, n_velocity, seq_len = token_per_bar, need_end_token=False)
+
+        if need_end_token:
+            for i in range(len(tokens) - 1, -1, -1):
+                if tokens[i]!= "pad":
+                    tokens[i] = "end"
+                    break
+            else:
+                if len(tokens) > 0:
+                    tokens[0] = "end"
+
+        if seq_len is not None:
+            tokens += ["pad" for _ in range(seq_len - len(tokens))]
+
+        return tokens
 
     tokens = []
 
-    tokens.append({"type": "start"})
+    tokens.append("start")
 
     # fill tokens with notes
     frame = 0
     
     for note in pr.notes:
         while note.onset > frame:
-            tokens.append({"type": "next_frame"})
+            tokens.append("next_frame")
             frame += 1
     
         tokens.append({"type": "pitch", "value": note.pitch - 21})
@@ -143,22 +189,22 @@ def tokenize(
         )
 
     for _ in range(pr.duration - frame):
-        tokens.append({"type": "next_frame"})
+        tokens.append("next_frame")
 
 
     if need_end_token:
-        tokens.append({"type": "end"})
+        tokens.append("end")
     
     if seq_len is not None:
         tokens = tokens[:seq_len]
     
         if len(tokens) < seq_len:
-            tokens += [{"type": "pad"}] * (seq_len - len(tokens))
+            tokens += ["pad"] * (seq_len - len(tokens))
 
     return tokens
 
 
-def get_output_mask(vocab: Vocabulary, tokens: list[dict]) -> torch.Tensor:
+def get_output_mask(vocab: Vocabulary, tokens: list[str|dict|None]) -> torch.Tensor:
     """
     An additive mask for the model's output (logits) to prevent the model from predicting invalid tokens.
 
@@ -176,17 +222,17 @@ def get_output_mask(vocab: Vocabulary, tokens: list[dict]) -> torch.Tensor:
         # output shape: Output: [pitch(n_pitch), velocity(n_velocity), next_frame(1)]
         token = tokens[i]
 
-        if token["type"] in ["start", "velocity", "next_frame"]:
+        if token in ["start", "next_frame", None] or (isinstance(token, dict) and token["type"] == "velocity"):
             # enable pitch or next_frame
             mask_token_types.append(["pitch", "next_frame"])
-        elif token["type"] == "pitch":
+        elif isinstance(token, dict) and token["type"] == "pitch":
             # enable velocity
             mask_token_types.append("velocity")
-        elif token["type"] in ["pad", "end"]:
+        elif token in ['pad', 'end']:
             # end token
             mask_token_types.append([])  # tokens after end are ignored
         else:
-            raise ValueError(f"Invalid token type: {token['type']}")
+            raise ValueError(f"Invalid token type: {token}")
 
     mask = vocab.get_mask(mask_token_types)
 
@@ -198,11 +244,11 @@ def detokenize(tokens, n_velocity):
     frame = 0
     last_pitch = None
     for token in tokens:
-        if token["type"] == "start":
+        if token == "start":
             continue
-        if token["type"] == "pitch":
+        if isinstance(token, dict) and token["type"] == "pitch":
             last_pitch = token["value"]
-        if token["type"] == "velocity":
+        if isinstance(token, dict) and token["type"] == "velocity":
             assert last_pitch is not None
             notes.append(
                 Note(
@@ -211,8 +257,8 @@ def detokenize(tokens, n_velocity):
                     velocity=int(token["value"] * (128 / n_velocity)),
                 )
             )
-        if token["type"] == "next_frame":
+        if token == "next_frame":
             frame += 1
-        if token["type"] == "end":
+        if token == "end":
             break
     return Pianoroll(notes)
