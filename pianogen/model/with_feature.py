@@ -612,6 +612,10 @@ class Cake(nn.Module):
             piano_roll = self.piano_roll
         )
 
+        self.first_bar_a0 = nn.Parameter(torch.zeros(a0_size))
+        # initialize the first bar a0 using xavier initialization
+        nn.init.uniform_(self.first_bar_a0, -1, 1)
+
     def calculate_loss(self, gt_feature: Dict[str, Tensor|Dict[str,Tensor]]) -> Dict[str, Tensor]:
         '''
         Args:
@@ -646,9 +650,12 @@ class Cake(nn.Module):
         a0 = self.stem(all_feature_embeds_cat) # [B, L, a0_size]
 
         # a0 is shifted right by one bar to avoid information leakage from the embedding of the current bar.
-        # the a0 of the first bar is defined to be zero.
+        # the a0 of the first bar is defined by the first_bar_a0 parameter.
 
-        a0 = torch.cat([torch.zeros_like(a0[:,:1]), a0[:,:-1]], dim=1) # [B, L, a0_size]
+        a0 = torch.cat([
+            self.first_bar_a0.view(1, 1, -1).expand(a0.shape[0], 1, -1), # [B, 1, a0_size]
+            a0[:,:-1]
+        ], dim=1) # [B, L, a0_size]
 
         # after the stem, all the features are predicted locally (bar-wise). Therefore, from now on,
         # the batch dimension and the bar dimension are merged.
@@ -689,7 +696,7 @@ class Cake(nn.Module):
         for _ in tqdm(range(n_bars)):
             if history.shape[1] == 0:
                 # a0 of the first bar is zero
-                a0 = torch.zeros(batch_size, 1, self.a0_size, device=device) # [B, 1, a0_size]
+                a0 = self.first_bar_a0.view(1, 1, -1).expand(batch_size, 1, -1) # [B, 1, a0_size]
             else:
                 a0 = self.stem(history) # [B, L, a0_size]
     
