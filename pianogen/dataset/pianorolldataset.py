@@ -41,7 +41,7 @@ class PianoRollDataset(TorchDataset):
         hop_len=32,
         max_duration=32 * 180,
     ):
-        self.mds = MusicDataset(Path(data_dir))
+        self.mds = MusicDataset(Path(data_dir), "pianoroll")
         self.segment_length = segment_len
 
         # flattened data structure for the samples for faster pickling

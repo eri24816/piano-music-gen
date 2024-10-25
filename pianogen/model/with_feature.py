@@ -1,5 +1,8 @@
 from itertools import product
-from typing import Any, Dict, Generic, OrderedDict, TypeVar
+from pathlib import Path
+from typing import Any, Dict, Generic, OrderedDict, Sequence, TypeVar
+from music_data_analysis import Pianoroll
+import numpy as np
 from torch import Tensor, nn
 import torch
 from tqdm import tqdm
@@ -141,16 +144,16 @@ class ScalarFeature(Feature[Tensor]):
         return ScalarLoader(self.file_name, self.granularity, self.vmin, self.vmax, self.num_classes)
 
     def get_logits(self, conditions: Dict[str, Any]) -> Tensor:
-        condition = torch.cat([conditions[key] for key in conditions], dim=1)
-        return self.classifier(condition)
+        condition = torch.cat([conditions[key] for key in conditions], dim=1) # [B, D]
+        return self.classifier(condition) # [B, num_classes]
 
     def calculate_loss(self, conditions: Dict[str, Any], gt: Tensor) -> Tensor:
         logits = self.get_logits(conditions)
         return nn.CrossEntropyLoss()(logits, gt)
         
     def generate(self, conditions: Dict[str, Any]) -> Tensor:
-        logits = self.get_logits(conditions)
-        return torch.argmax(logits, dim=1)
+        logits = self.get_logits(conditions) # [B, num_classes]
+        return torch.argmax(logits, dim=1) # [B]
     
     def embed(self, data: Tensor) -> Tensor:
         return data.float().unsqueeze(-1) / (self.num_classes - 1) # normalize to [0, 1], [B, L, 1]
@@ -287,14 +290,13 @@ class PianoRollLoader(FeatureLoader):
                 indices: Tensor [L,self.token_per_bar]
                 pos_frame: Tensor [L,self.token_per_bar]
                 pos_pitch: Tensor [L,self.token_per_bar]
-                output_mask: Tensor [L,3self.token_per_bar2, len(tokenizer.vocab)]
+                output_mask: Tensor [L,self.token_per_bar2, len(tokenizer.vocab)]
         '''
         pr = sample.song.read_pianoroll('pianoroll').slice(sample.start, sample.end)
         all_tokens = self.tokenizer.tokenize(pr,
                                             token_per_bar=self.token_per_bar,
                                             token_seq_len=self.token_per_bar*(pad_to//32))
 
-        #result:list[Dict[str, Any]] = []
         indices_list = []
         pos_frame_list = []
         pos_pitch_list = []
@@ -311,11 +313,16 @@ class PianoRollLoader(FeatureLoader):
             pos_pitch_list.append(pos_pitch)
             output_mask_list.append(output_mask)
 
+        duration_in_bars = np.ceil((sample.end - sample.start) / 32)
+        not_playing_bars = pad_to//32 - duration_in_bars
+        playing_mask_list = [1] * int(duration_in_bars) + [0] * int(not_playing_bars)
+
         return {
             "indices": torch.stack(indices_list, dim=0),
             "pos_frame": torch.stack(pos_frame_list, dim=0),
             "pos_pitch": torch.stack(pos_pitch_list, dim=0),
-            "output_mask": torch.stack(output_mask_list, dim=0)
+            "output_mask": torch.stack(output_mask_list, dim=0),
+            "playing_mask": torch.tensor(playing_mask_list, dtype=torch.int)
         }
 
 class PianoRollFeature(Feature):
@@ -324,7 +331,7 @@ class PianoRollFeature(Feature):
         condition_size: Dict[str, int],
         token_per_bar:int=64,
         hidden_dim: int=256,
-        num_layers: int=6,
+        num_layers: int=4,
         n_pitch: int=88,
         n_velocity: int=32,
 
@@ -354,7 +361,7 @@ class PianoRollFeature(Feature):
         self.input_embedding = nn.Embedding(len(self.tokenizer.vocab), hidden_dim - 12)
 
         self.transformer = nn.TransformerEncoder(
-            nn.TransformerEncoderLayer(d_model=hidden_dim, nhead=8, dim_feedforward=1024, batch_first=True),
+            nn.TransformerEncoderLayer(d_model=hidden_dim, nhead=8, dim_feedforward=512, batch_first=True),
             num_layers=num_layers
         )
         self.output_layer = nn.Linear(hidden_dim, len(self.tokenizer.vocab))
@@ -404,7 +411,7 @@ class PianoRollFeature(Feature):
         
         x = torch.cat([start_token_mark, pos_enc_this, pos_enc_next, pos_enc_pitch, x], dim=-1) # B, L, D
 
-        x = self.transformer(x, mask = nn.Transformer.generate_square_subsequent_mask(x.shape[1]))
+        x = self.transformer(x, mask = nn.Transformer.generate_square_subsequent_mask(x.shape[1]), is_causal=True)
 
         x = self.output_layer(x) # B, L, out
 
@@ -420,16 +427,14 @@ class PianoRollFeature(Feature):
         indices = torch.zeros(B,0,dtype=torch.long, device=device) # B, L=0
         pos_frame = torch.zeros(B,1,dtype=torch.long, device=device) # B, L=0
         pos_pitch = torch.zeros(B,0,dtype=torch.long, device=device) # B, L=0
-        tokens = []
     
         last_token = [None] * B
 
         max_length = 64 # maximum length
-        for _ in tqdm(range(max_length)):
+        for _ in range(max_length):
     
             logits = self.get_logits(conditions, indices, pos_frame, pos_pitch)[:,-1].detach().cpu()
             new_token = [self.tokenizer.sample_from_logits(logits[i], last_token[i], method='nucleus', p=0.9) for i in range(B)]
-            tokens.append(new_token)
             last_token = new_token
     
             # update indices and pos
@@ -443,31 +448,33 @@ class PianoRollFeature(Feature):
                 else:
                     new_pos_frame = pos_frame[i,-1]
                 new_pos_frame_batch.append(new_pos_frame)
-            pos_frame = torch.cat([pos_frame, torch.tensor([new_pos_frame_batch]).to(device)], dim=-1)
+            pos_frame = torch.cat([pos_frame, torch.tensor(new_pos_frame_batch).unsqueeze(1).to(device)], dim=-1)
 
             new_pos_pitch_batch = []
             for i in range(B):
                 
                 if isinstance(new_token[i], dict) and new_token[i]['type'] == 'pitch':
                     new_pos_pitch = new_token[i]['value']
+                elif new_token[i] == 'next_frame':
+                    new_pos_pitch = 0
                 else:
                     if pos_pitch.shape[1] == 0:
                         new_pos_pitch = 0
                     else:
                         new_pos_pitch = pos_pitch[i,-1]
                 new_pos_pitch_batch.append(new_pos_pitch)
-            pos_pitch = torch.cat([pos_pitch, torch.tensor([new_pos_pitch_batch]).to(device)], dim=-1)
+            pos_pitch = torch.cat([pos_pitch, torch.tensor(new_pos_pitch_batch).unsqueeze(1).to(device)], dim=-1)
 
             new_token_idx = [self.tokenizer.token_to_idx(token) for token in new_token]
-            indices = torch.cat([indices, torch.tensor([new_token_idx]).to(device)], dim=-1)
+            indices = torch.cat([indices, torch.tensor(new_token_idx).unsqueeze(1).to(device)], dim=-1)
 
             # break if all new_pos_frame >= 32
             if all(x >= 32 for x in new_pos_frame_batch):
                 break
 
         # pad to self.token_per_bar
-        if len(tokens) % self.token_per_bar != 0:
-            pad_length = self.token_per_bar - len(tokens) % self.token_per_bar
+        if indices.shape[1] < self.token_per_bar:
+            pad_length = self.token_per_bar - indices.shape[1]
             indices = torch.cat([indices, 0+torch.zeros(B, pad_length, dtype=torch.long, device=device)], dim=-1)
             pos_frame = torch.cat([pos_frame, 32+torch.zeros(B, pad_length, dtype=torch.long, device=device)], dim=-1)
             pos_pitch = torch.cat([pos_pitch, 0+torch.zeros(B, pad_length, dtype=torch.long, device=device)], dim=-1)
@@ -537,7 +544,7 @@ class Stem(nn.Module):
         )
         self.output_layer = nn.Linear(dim_model, dim_output)
         # self.pe = sinusoidal_positional_encoding(max_len, dim_model)
-        self.register_buffer('pe', sinusoidal_positional_encoding(max_len, dim_model).unsqueeze(0))
+        self.register_buffer('pe', sinusoidal_positional_encoding(max_len, dim_model))
 
     def forward(self, x: Tensor) -> Tensor:
         '''_summary_
@@ -548,13 +555,28 @@ class Stem(nn.Module):
         Returns:
             Tensor: [B, L, D]
         '''
-        x = self.input_layer(x) + self.pe[:x.shape[1]]
-        x = self.transformer(x, mask = nn.Transformer.generate_square_subsequent_mask(x.shape[1]))
+        x = self.input_layer(x) + self.pe[:x.shape[1]].unsqueeze(0)
+        x = self.transformer(x, mask = nn.Transformer.generate_square_subsequent_mask(x.shape[1]), is_causal=True)
         x = self.output_layer(x)
         return x
 
 def all_same(items):
     return all(x == items[0] for x in items)
+
+def concat_tensors_in_nested_dict(d: Sequence[dict]) -> dict[str, Tensor]:
+    '''
+    Concatenate the tensors in a list of nested dictionaries.
+    '''
+    res = {}
+    for key in d[0]:
+        if isinstance(d[0][key], dict):
+            res[key] = concat_tensors_in_nested_dict([x[key] for x in d])
+        else:
+            res[key] = torch.cat([x[key] for x in d], dim=-1)
+
+    return res
+        
+
 
 class Cake(nn.Module):
     '''Propagate information using the stem, then predict the features' values locally one by one.
@@ -579,7 +601,7 @@ class Cake(nn.Module):
         self.density = ScalarFeature(condition_size.copy(), dim_model , 'note_density', 32,
             vmin=0, vmax=32, num_classes=16)
         condition_size['density'] = 1
-        self.piano_roll = PianoRollFeature(256, condition_size.copy(), 64)
+        self.piano_roll = PianoRollFeature(256, condition_size.copy(), 150)
         condition_size['piano_roll'] = 256
 
         self.features: OrderedDict[str, Feature] = OrderedDict(
@@ -636,27 +658,35 @@ class Cake(nn.Module):
 
         # accumulate the loss of predicting each feature
 
-        conditions = OrderedDict(a0=a0) # the global information
+        conditions = OrderedDict()
         losses = {}
+        loss_mask = gt_feature_merged['piano_roll']['playing_mask']==1 # only calculate the loss of bars that are still playing
+        conditions['a0'] = a0[loss_mask]
         for feature_name, feature_model in self.features.items():
             # calculate the loss of the feature based on the current conditions
 
             # conditions: Dict[str, Tensor]: [B*L, D]
             # gt_feature_merged[feature_name]: [B*L, ...] or Dict[str, Tensor]: [B*L, ...]
-            losses[feature_name] = feature_model.calculate_loss(conditions, gt_feature_merged[feature_name])
+            if isinstance(gt_feature_merged[feature_name], dict):
+                gt = {key: value[loss_mask] for key, value in gt_feature_merged[feature_name].items()}
+            else:
+                gt = gt_feature_merged[feature_name][loss_mask]
+            losses[feature_name] = feature_model.calculate_loss(conditions, gt)
 
             # use the ground truth feature as condition for the following features
-            conditions[feature_name] = all_feature_embeds[feature_name].view(B*L, -1)
+            conditions[feature_name] = all_feature_embeds[feature_name].view(B*L, -1)[loss_mask]
 
         losses['total'] = sum(losses.values())
         return losses
 
     
-    def generate(self, n_bars: int, batch_size: int=1) -> Dict[str, Tensor]:
+    def generate(self, n_bars: int, batch_size: int=1) -> Dict[str, Any]:
         device = next(self.parameters()).device
         history: Tensor = torch.zeros(batch_size, 0, self.stem_input_dim,device=device) # [B, L=0, D]
 
-        for _ in range(n_bars):
+        generated_all = []
+
+        for _ in tqdm(range(n_bars)):
             if history.shape[1] == 0:
                 # a0 of the first bar is zero
                 a0 = torch.zeros(batch_size, 1, self.a0_size, device=device) # [B, 1, a0_size]
@@ -670,10 +700,9 @@ class Cake(nn.Module):
             generated = {}
             for feature_name, feature_model in self.features.items():
                 generated[feature_name] = feature_model.generate(conditions)
+                conditions[feature_name] = self.features[feature_name].embed(generated[feature_name])
 
-                for feature_name, feature_data in generated.items():
-                    conditions[feature_name] = self.features[feature_name].embed(feature_data)
-
+            generated_all.append(generated)
             embeds = conditions.copy()
             embeds.pop('a0')
 
@@ -681,4 +710,29 @@ class Cake(nn.Module):
             embeds_cat = embeds_cat.unsqueeze(1) # [B, 1, D]
             history = torch.cat([history, embeds_cat], dim=1) # [B, L+1, D]
 
-        return generated
+        return concat_tensors_in_nested_dict(generated_all)
+    
+    def sample_and_save(self, save_path:str|Path, n_bars:int, batch_size:int=1):
+        '''
+        Sample a song and save it to the save_path.
+        '''
+        save_path = Path(save_path)
+        generated = self.generate(n_bars, batch_size)
+        batch = generated['piano_roll']['indices']
+        for i, indices in enumerate(batch):
+            tokens = self.piano_roll.tokenizer.idx_to_token_seq(indices.cpu().tolist())
+            if batch_size == 1:
+                song_save_path = save_path
+            else:
+                song_save_path = save_path.with_name(save_path.stem + f'_{i}.mid')
+
+            pianoroll = Pianoroll([])
+            for bar in range(n_bars):
+                pr = self.piano_roll.tokenizer.detokenize(tokens[bar*self.piano_roll.token_per_bar:(bar+1)*self.piano_roll.token_per_bar])
+                pianoroll += (pr >> pianoroll.duration)
+            pianoroll.to_midi(song_save_path)
+
+        print('Generated: ', tokens[:10])
+        print('Chords: ', self.chord.vocab.indices_to_tokens(generated['chord'][0,:32].cpu()))
+        return tokens
+        

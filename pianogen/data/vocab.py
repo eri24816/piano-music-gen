@@ -123,6 +123,13 @@ class Vocabulary:
         """
 
         return torch.tensor([self.get_idx(token) for token in tokens], dtype=torch.long)
+    
+    def indices_to_tokens(self, indices: torch.Tensor):
+        """
+        Returns [len(indices)] list of tokens.
+        """
+
+        return [self.get_token(idx.item()) for idx in indices]
 
     def get_mask(
         self,
