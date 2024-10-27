@@ -1,7 +1,9 @@
+from pathlib import Path
 from typing import Dict
+import music_data_analysis
 from torch.utils.data import Dataset
 from pianogen.dataset.pianorolldataset import PianoRollDataset, Sample
-from pianogen.model.with_feature import Feature
+from pianogen.model.with_feature import FeatureLoader
 
 class FeatureDataset(Dataset):
     """
@@ -10,17 +12,30 @@ class FeatureDataset(Dataset):
     features: [L, D]
     """
 
+    @staticmethod
+    def from_midi(midi_path: str|Path, loaders: Dict[str, FeatureLoader], sync: bool = False, segment_len: int = 0, hop_len: int = 32, max_duration: int = 32*180):
+        '''From a midi file or a directory of midi files, create a FeatureDataset.
+        This function will run music_data_analysis on the midi files to create a dataset of pianorolls.
+        The dataset will be stored in a temporary directory.
+
+        Args:
+            midi_path (str | Path): A path to a midi file or a directory containing midi files
+            loaders (Dict[str, FeatureLoader]): A dictionary of FeatureLoader objects
+        '''
+        dataset_path = music_data_analysis.run(midi_path).dataset_path
+        return FeatureDataset(dataset_path, loaders, segment_len, hop_len, max_duration)
+
+
     def __init__(
         self,
-        piano_roll_dataset: PianoRollDataset,
-        features: Dict[str, Feature],
+        path: str|Path,
+        loaders: Dict[str, FeatureLoader],
+        segment_len=0,
+        hop_len=32,
+        max_duration=32 * 180,
     ):
-        self.ds = piano_roll_dataset
-
-        # Avoid reference to the Feature objects to prevent copying neural networks inside the Feature objects.
-        self.loaders = {
-            name: feature.get_loader() for name, feature in features.items()
-        }
+        self.ds = PianoRollDataset(path, segment_len, hop_len, max_duration)
+        self.loaders = loaders
 
     def __len__(self):
         return len(self.ds)

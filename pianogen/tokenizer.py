@@ -3,6 +3,47 @@ import torch
 from music_data_analysis.data import Note, Pianoroll
 from pianogen.data.vocab import Vocabulary, WordArray
 
+class OutputMask:
+    def __init__(self, vocab: Vocabulary):
+        self.vocab = vocab
+        self.pitch_next_frame = self.vocab.get_mask([["pitch", "next_frame"]])[0]
+        self.velocity = self.vocab.get_mask([["velocity"]])[0]
+        self.none = self.vocab.get_mask([[]])[0]
+        self.mask_types = torch.stack([self.pitch_next_frame, self.velocity, self.none])
+
+    def get(self, tokens: Sequence[str|dict|None]) -> torch.Tensor:
+        """
+        An additive mask for the model's output (logits) to prevent the model from predicting invalid tokens.
+        
+        The first token must be pitch or next_frame.
+        The next token of pitch must be velocity.
+        The next token of next_frame can be pitch or next_frame.
+        The next token of velocity must be pitch or next_frame.
+        
+        Accroding to the above rule, we can construct a mask as a prior on the model's prediction.
+        """
+        
+        mask_type_seq = []
+        
+        for i in range(len(tokens)):
+            # output shape: Output: [pitch(n_pitch), velocity(n_velocity), next_frame(1)]
+            token = tokens[i]
+        
+            if token in ["start", "next_frame", None] or (isinstance(token, dict) and token["type"] == "velocity"):
+                # enable pitch or next_frame
+                mask_type_seq.append(0)
+            elif isinstance(token, dict) and token["type"] == "pitch":
+                # enable velocity
+                mask_type_seq.append(1)
+            elif token in ['pad', 'end']:
+                # tokens after end are ignored
+                mask_type_seq.append(2)
+            else:
+                raise ValueError(f"Invalid token type: {token}")
+        
+        mask = self.mask_types[mask_type_seq]
+        
+        return mask
 
 class PianoRollTokenizer:
     def __init__(
@@ -24,6 +65,7 @@ class PianoRollTokenizer:
                 WordArray("velocity", {"type":["velocity"],"value": range(n_velocity)}),
             ]
         )
+        self.output_mask = OutputMask(self.vocab)
 
     def tokenize(self, pr: Pianoroll, pad: bool = True, token_seq_len: int | None = None, token_per_bar: int | None = None, need_end_token: bool = False
                  ) -> list[dict]:
@@ -102,7 +144,7 @@ class PianoRollTokenizer:
         return torch.tensor(result, dtype=torch.long)
 
     def get_output_mask(self, tokens: Sequence[str|dict|None]) -> torch.Tensor:
-        return get_output_mask(self.vocab, tokens)
+        return self.output_mask.get(tokens)
 
     def sample_from_logits(self, logits: torch.Tensor, last_token: str|dict|None, top_k: int = 15, p: float = 0.9, method: Literal["top_k", "nucleus"] = "nucleus") -> dict|str:
         # apply output mask
@@ -209,42 +251,6 @@ def tokenize(
             tokens += ["pad"] * (seq_len - len(tokens))
 
     return tokens
-
-
-def get_output_mask(vocab: Vocabulary, tokens: Sequence[str|dict|None]) -> torch.Tensor:
-    """
-    An additive mask for the model's output (logits) to prevent the model from predicting invalid tokens.
-
-    The first token must be pitch or next_frame.
-    The next token of pitch must be velocity.
-    The next token of next_frame can be pitch or next_frame.
-    The next token of velocity must be pitch or next_frame.
-
-    Accroding to the above rule, we can construct a mask as a prior on the model's prediction.
-    """
-
-    mask_token_types = []
-
-    for i in range(len(tokens)):
-        # output shape: Output: [pitch(n_pitch), velocity(n_velocity), next_frame(1)]
-        token = tokens[i]
-
-        if token in ["start", "next_frame", None] or (isinstance(token, dict) and token["type"] == "velocity"):
-            # enable pitch or next_frame
-            mask_token_types.append(["pitch", "next_frame"])
-        elif isinstance(token, dict) and token["type"] == "pitch":
-            # enable velocity
-            mask_token_types.append("velocity")
-        elif token in ['pad', 'end']:
-            # end token
-            mask_token_types.append([])  # tokens after end are ignored
-        else:
-            raise ValueError(f"Invalid token type: {token}")
-
-    mask = vocab.get_mask(mask_token_types)
-
-    return mask
-
 
 def detokenize(tokens, n_velocity):
     notes = []

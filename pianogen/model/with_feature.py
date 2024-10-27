@@ -1,6 +1,7 @@
 from itertools import product
 from pathlib import Path
-from typing import Any, Dict, Generic, OrderedDict, Sequence, TypeVar
+import tempfile
+from typing import Any, Callable, Dict, Generic, Mapping, OrderedDict, TypeVar
 from music_data_analysis import Pianoroll
 import numpy as np
 from torch import Tensor, nn
@@ -282,6 +283,49 @@ class PianoRollLoader(FeatureLoader):
     def __init__(self, tokenizer: PianoRollTokenizer, token_per_bar:int):
         self.tokenizer = tokenizer
         self.token_per_bar = token_per_bar
+        self.cache_path = Path(tempfile.mkdtemp())
+
+    def cache(self, sample: Sample, pad_to: int):
+        
+        cache_file = self.cache_path / f'{sample.song.song_name}_{sample.start}_{sample.end}.pt'
+
+        if cache_file.exists():
+            return torch.load(cache_file)
+
+        pr = sample.song.read_pianoroll('pianoroll').slice(sample.start, sample.end)
+        all_tokens = self.tokenizer.tokenize(pr,
+                                            token_per_bar=self.token_per_bar,
+                                            token_seq_len=self.token_per_bar*(pad_to//32))
+        
+        indices_list = []
+        pos_frame_list = []
+        pos_pitch_list = []
+        for i in range(0, len(all_tokens), self.token_per_bar): # each bar
+            tokens = all_tokens[i:i+self.token_per_bar]
+            indices = self.tokenizer.token_to_idx_seq(tokens)
+            pos = self.tokenizer.get_frame_indices(tokens)
+            pos_pitch = self.tokenizer.get_pitch_sequence(tokens)
+            
+            indices_list.append(torch.tensor(indices, dtype=torch.long))
+            pos_frame_list.append(pos)
+            pos_pitch_list.append(pos_pitch)
+        
+        duration_in_bars = np.ceil((sample.end - sample.start) / 32)
+        not_playing_bars = pad_to//32 - duration_in_bars
+        playing_mask_list = [1] * int(duration_in_bars) + [0] * int(not_playing_bars)
+        
+        cache_data = {
+            "indices": torch.stack(indices_list, dim=0),
+            "pos_frame": torch.stack(pos_frame_list, dim=0),
+            "pos_pitch": torch.stack(pos_pitch_list, dim=0),
+            "playing_mask": torch.tensor(playing_mask_list, dtype=torch.int),
+            "tokens": all_tokens
+        }
+
+        self.cache_path.mkdir(exist_ok=True)
+        torch.save(cache_data, self.cache_path / f'{sample.song.song_name}_{sample.start}_{sample.end}.pt')
+
+        return cache_data
 
     def load(self, sample: Sample, pad_to: int) -> Dict[str, Tensor]:
         '''
@@ -292,45 +336,24 @@ class PianoRollLoader(FeatureLoader):
                 pos_pitch: Tensor [L,self.token_per_bar]
                 output_mask: Tensor [L,self.token_per_bar2, len(tokenizer.vocab)]
         '''
-        pr = sample.song.read_pianoroll('pianoroll').slice(sample.start, sample.end)
-        all_tokens = self.tokenizer.tokenize(pr,
-                                            token_per_bar=self.token_per_bar,
-                                            token_seq_len=self.token_per_bar*(pad_to//32))
+        data = self.cache(sample, pad_to)
 
-        indices_list = []
-        pos_frame_list = []
-        pos_pitch_list = []
         output_mask_list = []
-        for i in range(0, len(all_tokens), self.token_per_bar): # each bar
-            tokens = all_tokens[i:i+self.token_per_bar]
-            indices = self.tokenizer.token_to_idx_seq(tokens)
-            pos = self.tokenizer.get_frame_indices(tokens)
-            pos_pitch = self.tokenizer.get_pitch_sequence(tokens)
+        for i in range(0, len(data['tokens']), self.token_per_bar): # each bar
+            tokens = data['tokens'][i:i+self.token_per_bar]
             output_mask = self.tokenizer.get_output_mask([None] + tokens[:-1])
-            
-            indices_list.append(torch.tensor(indices, dtype=torch.long))
-            pos_frame_list.append(pos)
-            pos_pitch_list.append(pos_pitch)
             output_mask_list.append(output_mask)
 
-        duration_in_bars = np.ceil((sample.end - sample.start) / 32)
-        not_playing_bars = pad_to//32 - duration_in_bars
-        playing_mask_list = [1] * int(duration_in_bars) + [0] * int(not_playing_bars)
-
-        return {
-            "indices": torch.stack(indices_list, dim=0),
-            "pos_frame": torch.stack(pos_frame_list, dim=0),
-            "pos_pitch": torch.stack(pos_pitch_list, dim=0),
-            "output_mask": torch.stack(output_mask_list, dim=0),
-            "playing_mask": torch.tensor(playing_mask_list, dtype=torch.int)
-        }
-
+        data['output_mask'] = torch.stack(output_mask_list, dim=0)
+        data.pop('tokens')
+        return data
+    
 class PianoRollFeature(Feature):
     def __init__(self, 
         embed_size: int,
         condition_size: Dict[str, int],
         token_per_bar:int=64,
-        hidden_dim: int=256,
+        hidden_dim: int=384,
         num_layers: int=4,
         n_pitch: int=88,
         n_velocity: int=32,
@@ -370,12 +393,12 @@ class PianoRollFeature(Feature):
 
 
         # for embedding
-        self.embed_embedding = nn.Embedding(len(self.tokenizer.vocab), hidden_dim - 7)
+        self.embed_embedding = nn.Embedding(len(self.tokenizer.vocab), embed_hidden_dim - 7)
         self.embed_transformer = nn.TransformerEncoder(
             nn.TransformerEncoderLayer(d_model=embed_hidden_dim, nhead=8, dim_feedforward=256, batch_first=True),
             num_layers=embed_num_layers
         )
-        self.embed_output_layer = nn.Linear(hidden_dim, embed_size)
+        self.embed_output_layer = nn.Linear(embed_hidden_dim, embed_size)
     
     def get_loader(self) -> FeatureLoader:
         return PianoRollLoader(self.tokenizer, self.token_per_bar)
@@ -430,8 +453,7 @@ class PianoRollFeature(Feature):
     
         last_token = [None] * B
 
-        max_length = 64 # maximum length
-        for _ in range(max_length):
+        for _ in range(self.token_per_bar):
     
             logits = self.get_logits(conditions, indices, pos_frame, pos_pitch)[:,-1].detach().cpu()
             new_token = [self.tokenizer.sample_from_logits(logits[i], last_token[i], method='nucleus', p=0.9) for i in range(B)]
@@ -535,14 +557,13 @@ class Stem(nn.Module):
     Args:
         
     '''
-    def __init__(self, dim_input:int, dim_output:int, max_len:int, dim_model: int, num_layers: int, dim_feedforward: int, num_heads: int=8, dropout: float=0.1):
+    def __init__(self, dim_input:int, max_len:int, dim_model: int, num_layers: int, dim_feedforward: int, num_heads: int=8, dropout: float=0.1):
         super().__init__()
         self.input_layer = nn.Linear(dim_input, dim_model)
         self.transformer = nn.TransformerEncoder(
             nn.TransformerEncoderLayer(dim_model, num_heads, dim_feedforward, dropout, batch_first=True),
             num_layers
         )
-        self.output_layer = nn.Linear(dim_model, dim_output)
         # self.pe = sinusoidal_positional_encoding(max_len, dim_model)
         self.register_buffer('pe', sinusoidal_positional_encoding(max_len, dim_model))
 
@@ -557,25 +578,39 @@ class Stem(nn.Module):
         '''
         x = self.input_layer(x) + self.pe[:x.shape[1]].unsqueeze(0)
         x = self.transformer(x, mask = nn.Transformer.generate_square_subsequent_mask(x.shape[1]), is_causal=True)
-        x = self.output_layer(x)
         return x
 
 def all_same(items):
     return all(x == items[0] for x in items)
 
-def concat_tensors_in_nested_dict(d: Sequence[dict]) -> dict[str, Tensor]:
+def apply_tensors_in_nested_dict(d: Tensor|Mapping[str, Tensor|dict[str,Tensor]], f: Callable[[Tensor], Tensor]) -> Tensor|dict[str, Tensor]:
+    '''
+    Apply a function to all tensors in a nested dictionary.
+    '''
+    res = {}
+    if isinstance(d, Tensor):
+        return f(d)
+    for k, v in d.items():
+        if isinstance(v, dict):
+            res[k] = apply_tensors_in_nested_dict(v, f)
+        else:
+            res[k] = f(v)
+    return res
+
+def concat_tensors_in_nested_dict(d: list[dict]|list[Tensor], dim:int, drop_missing=False) -> dict[str, Tensor]|Tensor:
     '''
     Concatenate the tensors in a list of nested dictionaries.
     '''
     res = {}
-    for key in d[0]:
-        if isinstance(d[0][key], dict):
-            res[key] = concat_tensors_in_nested_dict([x[key] for x in d])
-        else:
-            res[key] = torch.cat([x[key] for x in d], dim=-1)
+    if isinstance(d[0], Tensor):
+        d: list[Tensor]
+        return torch.cat(d, dim=dim)
+    for k in d[0].keys():
+        if drop_missing and any(k not in x for x in d):
+            continue
+        res[k] = concat_tensors_in_nested_dict([x[k] for x in d], dim, drop_missing)
 
     return res
-        
 
 
 class Cake(nn.Module):
@@ -587,10 +622,10 @@ class Cake(nn.Module):
 
         self.stem_input_dim = 256+3+256
         self.a0_size = a0_size
-        self.stem = Stem(self.stem_input_dim, a0_size, max_len, dim_model, num_layers, dim_feedforward, num_heads, dropout)
+        self.stem = Stem(self.stem_input_dim,  max_len,a0_size, num_layers, dim_feedforward, num_heads, dropout)
 
         condition_size = {'a0': a0_size}
-        self.chord = ChordFeature(256, condition_size.copy(), 128)
+        self.chord = ChordFeature(256, condition_size.copy(), 256)
         condition_size['chord'] = 256
         self.velocity = ScalarFeature(condition_size.copy(), dim_model, 'velocity', 32,
             vmin=0, vmax=128, num_classes=32)
@@ -687,27 +722,52 @@ class Cake(nn.Module):
         return losses
 
     
-    def generate(self, n_bars: int, batch_size: int=1) -> Dict[str, Any]:
+    def generate(self, n_bars: int, batch_size: int=1,
+        prompt:Mapping[str, Tensor|Dict[str,Tensor]]|None = None,
+        prompt_bars:int=0
+    ) -> Dict[str, Any]:
+        '''
+        Generate a song with n_bars.
+        Each dict value in prompt is [L, ...] or Dict[str, Tensor]: [L, ...]
+        '''
         device = next(self.parameters()).device
-        history: Tensor = torch.zeros(batch_size, 0, self.stem_input_dim,device=device) # [B, L=0, D]
 
-        generated_all = []
+        if prompt is not None and prompt_bars == 0:
+            assert isinstance(prompt['piano_roll'], dict)
+            prompt_bars = int(prompt['piano_roll']['playing_mask'].sum().item())
 
-        for _ in tqdm(range(n_bars)):
+        if prompt is not None:
+            # convert the prompt to embeddings
+            prompt_embeds = OrderedDict()
+            prompt = apply_tensors_in_nested_dict(prompt, lambda x: x[: prompt_bars].to(device)) # truncate the prompt to prompt_bars
+            # prompt: nested dict of [L, ...]
+            
+            for name, feature_data in prompt.items():
+                prompt_embeds[name] = self.features[name].embed(feature_data).unsqueeze(0).expand(batch_size, -1, -1) # [1, L, D]
+
+            history = torch.cat([prompt_embeds[key] for key in prompt_embeds], dim=2) # [B, L, D]
+
+            generated_all = [apply_tensors_in_nested_dict(prompt, lambda x: x.unsqueeze(0).expand(batch_size, *([-1]*len(x.shape))))] # [B, L, ...]
+
+        else:
+            history: Tensor = torch.zeros(batch_size, 0, self.stem_input_dim,device=device) # [B, L=0, D]
+
+            generated_all = []
+
+        for _ in tqdm(range(prompt_bars, n_bars)):
             if history.shape[1] == 0:
                 # a0 of the first bar is zero
                 a0 = self.first_bar_a0.view(1, 1, -1).expand(batch_size, 1, -1) # [B, 1, a0_size]
             else:
-                a0 = self.stem(history) # [B, L, a0_size]
-    
-            a0 = a0[:,-1] # [B, a0_size]
+                a0 = self.stem(history)[:,-1] # [B, 1, a0_size]
 
             # generate the features
             conditions = OrderedDict(a0=a0)
             generated = {}
-            for feature_name, feature_model in self.features.items():
-                generated[feature_name] = feature_model.generate(conditions)
-                conditions[feature_name] = self.features[feature_name].embed(generated[feature_name])
+            for name, model in self.features.items():
+                feature_generated = model.generate(conditions) # [B, ...]
+                generated[name] = apply_tensors_in_nested_dict(feature_generated, lambda x: x.unsqueeze(1)) # [B, 1, ...]
+                conditions[name] = self.features[name].embed(feature_generated) # [B, D]
 
             generated_all.append(generated)
             embeds = conditions.copy()
@@ -717,17 +777,18 @@ class Cake(nn.Module):
             embeds_cat = embeds_cat.unsqueeze(1) # [B, 1, D]
             history = torch.cat([history, embeds_cat], dim=1) # [B, L+1, D]
 
-        return concat_tensors_in_nested_dict(generated_all)
+        return concat_tensors_in_nested_dict(generated_all, dim=1, drop_missing=True) # concat L dimension
     
-    def sample_and_save(self, save_path:str|Path, n_bars:int, batch_size:int=1):
+    def sample_and_save(self, save_path:str|Path, n_bars:int, batch_size:int=1, prompt:Mapping[str, Tensor|Dict[str,Tensor]]|None=None, prompt_bars:int=0):
         '''
         Sample a song and save it to the save_path.
         '''
         save_path = Path(save_path)
-        generated = self.generate(n_bars, batch_size)
+        generated = self.generate(n_bars, batch_size, prompt, prompt_bars)
         batch = generated['piano_roll']['indices']
+        B, L = batch.shape[:2]
         for i, indices in enumerate(batch):
-            tokens = self.piano_roll.tokenizer.idx_to_token_seq(indices.cpu().tolist())
+            tokens = self.piano_roll.tokenizer.idx_to_token_seq(indices.view(-1).cpu().tolist())
             if batch_size == 1:
                 song_save_path = save_path
             else:
@@ -740,6 +801,8 @@ class Cake(nn.Module):
             pianoroll.to_midi(song_save_path)
 
         print('Generated: ', tokens[:10])
-        print('Chords: ', self.chord.vocab.indices_to_tokens(generated['chord'][0,:32].cpu()))
+        print('Chords: ', self.chord.vocab.indices_to_tokens(generated['chord'].view(B,-1)[0,:32].cpu()))
         return tokens
         
+    def get_loaders(self) -> dict[str, FeatureLoader]:
+        return {key: value.get_loader() for key, value in self.features.items()}
