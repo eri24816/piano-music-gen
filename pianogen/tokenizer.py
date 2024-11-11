@@ -51,6 +51,7 @@ class PianoRollTokenizer:
         n_pitch,
         n_velocity,
         token_seq_len=None,
+        use_start_and_end_token=False,
     ):
         self.n_pitch = n_pitch
         self.n_velocity = n_velocity
@@ -58,8 +59,7 @@ class PianoRollTokenizer:
         self.vocab = Vocabulary(
             [
                 "pad",
-                #"start",
-                #"end",
+                *(["start", "end"] if use_start_and_end_token else []),
                 "next_frame",
                 WordArray("pitch", {"type":["pitch"],"value": range(n_pitch)}),
                 WordArray("velocity", {"type":["velocity"],"value": range(n_velocity)}),

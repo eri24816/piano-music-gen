@@ -117,7 +117,7 @@ class Vocabulary:
             torch.tensor(indices).T, torch.tensor(values), [len(tokens), len(self)]
         )
 
-    def tokens_to_indices(self, tokens: list[dict]):
+    def tokens_to_indices(self, tokens: Sequence[dict|str]):
         """
         Returns [len(tokens)] tensor.
         """

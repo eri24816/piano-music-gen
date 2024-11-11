@@ -1,7 +1,7 @@
 from itertools import product
 from pathlib import Path
 import tempfile
-from typing import Any, Callable, Dict, Generic, Mapping, OrderedDict, TypeVar
+from typing import Any, Callable, Dict, Generic, List, Mapping, OrderedDict, TypeVar
 from music_data_analysis import Pianoroll
 import numpy as np
 from torch import Tensor, nn
@@ -19,6 +19,13 @@ class FeatureLoader:
     '''
     def load(self, sample: Sample, pad_to: int) -> Any:
         raise NotImplementedError
+    
+    def to_human_representation(self, data: Tensor|dict[Tensor]) -> Any:
+        raise NotImplementedError
+    
+    def to_tensor_representation(self, data: Any) -> Tensor|dict[Tensor]:
+        raise NotImplementedError
+
 
 T = TypeVar('T')
 class Feature(nn.Module, Generic[T]):
@@ -94,6 +101,7 @@ class Feature(nn.Module, Generic[T]):
             Tensor: The embedded data.
         '''
         raise NotImplementedError
+    
 
 class ScalarLoader(FeatureLoader):
     def __init__(self, file_name: str, time_granularity: int, vmin: float, vmax: float, num_classes: int):
@@ -114,10 +122,37 @@ class ScalarLoader(FeatureLoader):
         indices = torch.clamp(indices, 0, self.num_classes-1)
 
         return indices
+    
+    def to_human_representation(self, indices: Tensor) -> List|float:
+        '''
+        Args:
+            indices (Tensor): [L]
+
+        Returns:
+            Tensor: [L]
+        '''
+        return (indices.float() / self.num_classes * (self.vmax - self.vmin) + self.vmin).tolist()
+    
+    def to_tensor_representation(self, scalars: Tensor|List[float]|float|int) -> Tensor:
+        '''
+        Args:
+            scalars (Tensor): [L]
+
+        Returns:
+            Tensor: [L]
+        '''
+        if not isinstance(scalars, Tensor):
+            scalars = torch.tensor(scalars, dtype=torch.float)
+        if len(scalars.shape) == 0:
+            scalars = scalars.unsqueeze(0)
+        indices = ((scalars - self.vmin) / (self.vmax - self.vmin) * self.num_classes).long()
+        indices = torch.clamp(indices, 0, self.num_classes-1)
+        return indices
 
 class ScalarFeature(Feature[Tensor]):
     '''
     data_type: Tensor
+    range: [vmin, vmax). Outside the range will be clamped.
     '''
     def __init__(self, condition_size: Dict[str,int], hidden_dim: int, file_name: str, time_granularity: int,
                     vmin: float, vmax: float, num_classes: int):
@@ -157,7 +192,7 @@ class ScalarFeature(Feature[Tensor]):
         return torch.argmax(logits, dim=1) # [B]
     
     def embed(self, data: Tensor) -> Tensor:
-        return data.float().unsqueeze(-1) / (self.num_classes - 1) # normalize to [0, 1], [B, L, 1]
+        return data.float().unsqueeze(-1) / self.num_classes # normalize to [0, 1], [B, L, 1]
 
 class ChordLoader(FeatureLoader):
 
@@ -175,6 +210,65 @@ class ChordLoader(FeatureLoader):
         indices = self.vocab.tokens_to_indices(chords) # [L*4]
         indices = indices.view(-1, 4) # [L, 4]
         return indices
+    
+    def to_human_representation(self, indices: Tensor) -> list[str]:
+        '''
+        Args:
+            indices (Tensor): [L, 4]
+
+        Returns:
+            list[str]: [L]
+        '''
+
+        def humanize_chord_name(name:'str') -> 'str':
+            if name == 'None':
+                return 'None'
+            root, quality = name.split('_')
+            if quality == 'M':
+                quality = ''
+            return root + quality
+
+        result = [self.vocab.indices_to_tokens(bar) for bar in indices]
+        for i, result_bar in enumerate(result):
+            if result_bar[0] == result_bar[1] == result_bar[2] == result_bar[3]:
+                result[i] = [result_bar[0]]
+            elif result_bar[0] == result_bar[1] and result_bar[2] == result_bar[3]:
+                result[i] = [result_bar[0], result_bar[2]]
+
+            result[i] = ' '.join([humanize_chord_name(name) for name in result[i]])
+                                                               
+        return result
+    
+    def to_tensor_representation(self, chords: list[str]) -> Tensor:
+        '''
+        Args:
+            chords (list[str]): [L]
+
+        Returns:
+            Tensor: [L, 4]
+        '''
+
+        def dehumanize_chord_name(name:'str') -> 'str':
+            if name == 'None':
+                return 'None'
+            root_len = 2 if len(name) > 1 and name[1] in ['b', '#'] else 1
+            root = name[:root_len]
+            quality = name[root_len:]
+            if quality == '':
+                quality = 'M'
+            root = root[0].upper() + root[1:]
+            return root + '_' + quality
+
+        indices = []
+        for bar in chords:
+            bar = bar.split()
+            bar = [dehumanize_chord_name(chord) for chord in bar]
+            if len(bar) == 1:
+                bar = [bar[0], bar[0], bar[0], bar[0]]
+            elif len(bar) == 2:
+                bar = [bar[0], bar[0], bar[1], bar[1]]
+            indices.append(self.vocab.tokens_to_indices(bar))
+        return torch.stack(indices, dim=0)
 
     
 class ChordFeature(Feature):
@@ -347,6 +441,25 @@ class PianoRollLoader(FeatureLoader):
         data['output_mask'] = torch.stack(output_mask_list, dim=0)
         data.pop('tokens')
         return data
+    
+    def to_human_representation(self, data: Dict[str, Tensor]) -> Pianoroll:
+        '''
+        Args:
+            data (Dict[str, Tensor]): A dictionary containing the following keys:
+                indices: Tensor [L,self.token_per_bar]
+                ...
+
+        Returns:
+            Pianoroll: A pianoroll object
+        '''
+        tokens = self.tokenizer.idx_to_token_seq(data['indices'].flatten().tolist())
+        n_bars = data['indices'].shape[0]
+        pianoroll = Pianoroll([])
+        for bar in range(n_bars):
+            pr = self.tokenizer.detokenize(tokens[bar*self.token_per_bar:(bar+1)*self.token_per_bar])
+            pianoroll += (pr >> bar*32)
+
+        return pianoroll
     
 class PianoRollFeature(Feature):
     def __init__(self, 
@@ -724,14 +837,13 @@ class Cake(nn.Module):
     
     def generate(self, n_bars: int, batch_size: int=1,
         prompt:Mapping[str, Tensor|Dict[str,Tensor]]|None = None,
-        prompt_bars:int=0
+        prompt_bars:int=0, given_features:dict|None=None
     ) -> Dict[str, Any]:
         '''
         Generate a song with n_bars.
         Each dict value in prompt is [L, ...] or Dict[str, Tensor]: [L, ...]
         '''
         device = next(self.parameters()).device
-
         if prompt is not None and prompt_bars == 0:
             assert isinstance(prompt['piano_roll'], dict)
             prompt_bars = int(prompt['piano_roll']['playing_mask'].sum().item())
@@ -757,15 +869,21 @@ class Cake(nn.Module):
         for _ in tqdm(range(prompt_bars, n_bars)):
             if history.shape[1] == 0:
                 # a0 of the first bar is zero
-                a0 = self.first_bar_a0.view(1, 1, -1).expand(batch_size, 1, -1) # [B, 1, a0_size]
+                a0 = self.first_bar_a0.view(1, -1).expand(batch_size, -1) # [B, a0_size]
             else:
-                a0 = self.stem(history)[:,-1] # [B, 1, a0_size]
+                a0 = self.stem(history)[:,-1] # [B, a0_size]
 
             # generate the features
             conditions = OrderedDict(a0=a0)
             generated = {}
             for name, model in self.features.items():
-                feature_generated = model.generate(conditions) # [B, ...]
+                print(name, given_features, name in given_features)
+                if given_features is not None and name in given_features:
+                    human_rep = [given_features[name]] # The list means bar dimension
+                    feature_generated = self.features[name].get_loader().to_tensor_representation(human_rep).to(device)
+                else:
+                    feature_generated = model.generate(conditions) # [B, ...]
+                # print(self.features[name].get_loader().to_human_representation(feature_generated))
                 generated[name] = apply_tensors_in_nested_dict(feature_generated, lambda x: x.unsqueeze(1)) # [B, 1, ...]
                 conditions[name] = self.features[name].embed(feature_generated) # [B, D]
 
@@ -779,6 +897,20 @@ class Cake(nn.Module):
 
         return concat_tensors_in_nested_dict(generated_all, dim=1, drop_missing=True) # concat L dimension
     
+    def indices_to_pianoroll(self, indices: Tensor) -> Pianoroll:
+        '''
+        indices: [L, self.token_per_bar] where L is bar dimension
+        '''
+        n_bars = indices.shape[0]
+        tokens = self.piano_roll.tokenizer.idx_to_token_seq(indices.view(-1).cpu().tolist())
+        
+        pianoroll = Pianoroll([])
+        for bar in range(n_bars):
+            pr = self.piano_roll.tokenizer.detokenize(tokens[bar*self.piano_roll.token_per_bar:(bar+1)*self.piano_roll.token_per_bar])
+            pianoroll += (pr >> bar*32)
+
+        return pianoroll
+
     def sample_and_save(self, save_path:str|Path, n_bars:int, batch_size:int=1, prompt:Mapping[str, Tensor|Dict[str,Tensor]]|None=None, prompt_bars:int=0):
         '''
         Sample a song and save it to the save_path.
@@ -786,23 +918,17 @@ class Cake(nn.Module):
         save_path = Path(save_path)
         generated = self.generate(n_bars, batch_size, prompt, prompt_bars)
         batch = generated['piano_roll']['indices']
-        B, L = batch.shape[:2]
         for i, indices in enumerate(batch):
-            tokens = self.piano_roll.tokenizer.idx_to_token_seq(indices.view(-1).cpu().tolist())
+            pianoroll = self.indices_to_pianoroll(indices)
+                
             if batch_size == 1:
                 song_save_path = save_path
             else:
                 song_save_path = save_path.with_name(save_path.stem + f'_{i}.mid')
-
-            pianoroll = Pianoroll([])
-            for bar in range(n_bars):
-                pr = self.piano_roll.tokenizer.detokenize(tokens[bar*self.piano_roll.token_per_bar:(bar+1)*self.piano_roll.token_per_bar])
-                pianoroll += (pr >> pianoroll.duration)
             pianoroll.to_midi(song_save_path)
 
-        print('Generated: ', tokens[:10])
-        print('Chords: ', self.chord.vocab.indices_to_tokens(generated['chord'].view(B,-1)[0,:32].cpu()))
-        return tokens
+        # print('Generated: ', tokens[:10])
+        # print('Chords: ', self.chord.vocab.indices_to_tokens(generated['chord'].view(B,-1)[0,:32].cpu()))
         
     def get_loaders(self) -> dict[str, FeatureLoader]:
         return {key: value.get_loader() for key, value in self.features.items()}
