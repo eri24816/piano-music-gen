@@ -10,6 +10,9 @@ dependencies = [
     "music-data-analysis @ git+https://github.com/eri24816/music-data-analysis.git"
 ]
 
+[tool.hatch.metadata]
+allow-direct-references = true
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
