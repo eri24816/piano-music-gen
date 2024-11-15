@@ -1,12 +1,13 @@
 from pathlib import Path
 import shutil
-from tempfile import tempdir
 import tempfile
 from typing import Dict
 import music_data_analysis
 from torch.utils.data import Dataset
 from pianogen.dataset.pianorolldataset import PianoRollDataset, Sample
 from pianogen.model.with_feature import FeatureLoader
+
+tempdir = tempfile.gettempdir()
 
 class FeatureDataset(Dataset):
     """
