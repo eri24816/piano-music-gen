@@ -196,6 +196,16 @@ class ScalarFeature(Feature[Tensor]):
 
 class ChordLoader(FeatureLoader):
 
+    note_alias = {
+        'Cb': 'B',
+        'Db': 'C#',
+        'Eb': 'D#',
+        'Fb': 'E',
+        'Gb': 'F#',
+        'Ab': 'G#',
+        'Bb': 'A#'
+    }
+
     def __init__(self, vocab: Vocabulary):
         self.vocab = vocab
 
@@ -256,7 +266,10 @@ class ChordLoader(FeatureLoader):
             quality = name[root_len:]
             if quality == '':
                 quality = 'M'
+
             root = root[0].upper() + root[1:]
+            if len(root) == 2 and root[1] == 'b':
+                root = self.note_alias[root]
             return root + '_' + quality
 
         indices = []
@@ -267,6 +280,8 @@ class ChordLoader(FeatureLoader):
                 bar = [bar[0], bar[0], bar[0], bar[0]]
             elif len(bar) == 2:
                 bar = [bar[0], bar[0], bar[1], bar[1]]
+            elif len(bar) == 3:
+                bar = [bar[0], bar[1], bar[2], bar[2]]
             indices.append(self.vocab.tokens_to_indices(bar))
         return torch.stack(indices, dim=0)
 
